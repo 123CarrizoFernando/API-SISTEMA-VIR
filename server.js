@@ -168,17 +168,36 @@ app.get('/api/actividades', async (req, res) => {
 app.post('/api/actividades', async (req, res) => {
     try {
         const { numero_modulo, orientacion, semana, materia, tipo_actividad, url_actividad } = req.body;
-        const result = await pool.query(
-            `INSERT INTO actividades_moodle (numero_modulo, orientacion, semana, materia, tipo_actividad, url_actividad)
-             VALUES ($1, $2, $3, $4, $5, $6)
-             ON CONFLICT (numero_modulo, orientacion, semana, materia) 
-             DO UPDATE SET url_actividad = EXCLUDED.url_actividad, tipo_actividad = EXCLUDED.tipo_actividad, activa = TRUE
-             RETURNING *`,
-            [numero_modulo, orientacion, semana, materia, tipo_actividad, url_actividad]
+        
+        // 1. Verificamos si ya existe una actividad para ese módulo, orientación, semana y materia
+        const existe = await pool.query(
+            `SELECT id FROM actividades_moodle 
+             WHERE numero_modulo = $1 AND orientacion = $2 AND semana = $3 AND materia = $4`,
+            [numero_modulo, orientacion, semana, materia]
         );
+
+        let result;
+        if (existe.rows.length > 0) {
+            // Si ya existe, la actualizamos
+            result = await pool.query(
+                `UPDATE actividades_moodle 
+                 SET tipo_actividad = $1, url_actividad = $2, activa = TRUE 
+                 WHERE id = $3 RETURNING *`,
+                [tipo_actividad, url_actividad, existe.rows[0].id]
+            );
+        } else {
+            // Si no existe, la insertamos
+            result = await pool.query(
+                `INSERT INTO actividades_moodle (numero_modulo, orientacion, semana, materia, tipo_actividad, url_actividad, activa)
+                 VALUES ($1, $2, $3, $4, $5, $6, TRUE) RETURNING *`,
+                [numero_modulo, orientacion, semana, materia, tipo_actividad, url_actividad]
+            );
+        }
+
         res.json(result.rows[0]);
     } catch (err) {
-        res.status(500).json({ error: 'Error al guardar actividad' });
+        console.error("Error en POST /api/actividades:", err);
+        res.status(500).json({ error: err.message });
     }
 });
 
@@ -307,36 +326,37 @@ app.put('/api/grupos/:id', async (req, res) => {
     }
 });
 
-// ============================================================================
-// 4. BOT INTEGRADO EN EL SERVIDOR (Para ejecutar desde el Celular o PC)
-// ============================================================================
-
-app.get('/api/bot/estado', (req, res) => {
-    res.json(estadoBot);
-});
-
 app.post('/api/ejecutar_bot', async (req, res) => {
     if (estadoBot.ejecutando) {
         return res.status(400).json({ error: 'El bot ya se está ejecutando en este momento.' });
     }
 
-    const { modulo, orientacion, anio = 2026, periodo = '2° Período' } = req.body;
+    // Ahora recibimos también "cursada_ids" (lista opcional de alumnos seleccionados)
+    const { modulo, orientacion, anio = 2026, periodo = '2° Período', cursada_ids } = req.body;
     res.json({ mensaje: 'Bot iniciado en segundo plano' });
 
-    // Ejecución asíncrona en segundo plano
-    ejecutarScrapingMoodle(modulo, orientacion, anio, periodo);
+    ejecutarScrapingMoodle(modulo, orientacion, anio, periodo, cursada_ids);
 });
 
-async function ejecutarScrapingMoodle(modulo, orientacion, anio, periodo) {
+async function ejecutarScrapingMoodle(modulo, orientacion, anio, periodo, cursadaIds = null) {
     estadoBot = { ejecutando: true, progreso: 'Iniciando barrido...', procesados: 0, total: 0 };
     try {
-        const resAlumnos = await pool.query(
-            `SELECT a.dni, a.contrasena_moodle, a.nombre_completo, c.id as cursada_id
-             FROM alumnos a JOIN cursadas_modulos c ON a.id = c.alumno_id
-             WHERE a.estado_general = 'Activo' AND c.numero_modulo = $1 AND c.orientacion = $2 AND c.anio = $3 AND c.periodo = $4
-             ORDER BY a.nombre_completo ASC`,
-            [modulo, orientacion, anio, periodo]
-        );
+        let queryAlumnos = `
+            SELECT a.dni, a.contrasena_moodle, a.nombre_completo, c.id as cursada_id
+            FROM alumnos a JOIN cursadas_modulos c ON a.id = c.alumno_id
+            WHERE a.estado_general = 'Activo' AND c.numero_modulo = $1 AND c.orientacion = $2 AND c.anio = $3 AND c.periodo = $4
+        `;
+        let params = [modulo, orientacion, anio, periodo];
+
+        // Si desde la App elegiste a 1 o varios alumnos puntuales, filtramos solo esos:
+        if (Array.isArray(cursadaIds) && cursadaIds.length > 0) {
+            queryAlumnos += ` AND c.id = ANY($5::int[])`;
+            params.push(cursadaIds);
+        }
+
+        queryAlumnos += ` ORDER BY a.nombre_completo ASC`;
+
+        const resAlumnos = await pool.query(queryAlumnos, params);
         const alumnos = resAlumnos.rows;
         estadoBot.total = alumnos.length;
 
@@ -354,32 +374,29 @@ async function ejecutarScrapingMoodle(modulo, orientacion, anio, periodo) {
 
         for (let i = 0; i < alumnos.length; i++) {
             const al = alumnos[i];
-            estadoBot.progreso = `Procesando: ${al.nombre_completo} (${i + 1}/${alumnos.length})`;
+            estadoBot.progreso = `Procesando (${i + 1}/${alumnos.length}): ${al.nombre_completo}`;
             estadoBot.procesados = i + 1;
 
             try {
                 const jar = new CookieJar();
                 const client = wrapper(axios.create({ jar, withCredentials: true, timeout: 15000 }));
 
-                // 1. Obtener logintoken de Moodle
                 const getLogin = await client.get(URL_LOGIN);
                 const $login = cheerio.load(getLogin.data);
                 const logintoken = $login('input[name="logintoken"]').val() || '';
 
-                // 2. Enviar credenciales
-                const params = new URLSearchParams();
-                params.append('username', String(al.dni).trim());
-                params.append('password', String(al.contrasena_moodle).trim());
-                if (logintoken) params.append('logintoken', logintoken);
+                const formParams = new URLSearchParams();
+                formParams.append('username', String(al.dni).trim());
+                formParams.append('password', String(al.contrasena_moodle).trim());
+                if (logintoken) formParams.append('logintoken', logintoken);
 
-                await client.post(URL_LOGIN, params.toString(), {
+                await client.post(URL_LOGIN, formParams.toString(), {
                     headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
                 });
 
                 let datosSemanas = {};
                 SEMANAS_ORDEN.forEach(s => datosSemanas[s] = { completas: [], faltan: [] });
 
-                // PASO A: Tabla General de Calificaciones
                 if (urlCalificaciones) {
                     const getGrades = await client.get(urlCalificaciones);
                     const $grades = cheerio.load(getGrades.data);
@@ -405,7 +422,6 @@ async function ejecutarScrapingMoodle(modulo, orientacion, anio, periodo) {
                     });
                 }
 
-                // PASO B: Enlaces Directos por Semana
                 for (const act of actividadesDirectas) {
                     const sem = act.semana;
                     const mat = act.materia;
@@ -435,7 +451,6 @@ async function ejecutarScrapingMoodle(modulo, orientacion, anio, periodo) {
                     }
                 }
 
-                // PASO C: Armar texto de resumen y guardar en Neon
                 let detallesTexto = [];
                 for (const sem of SEMANAS_ORDEN) {
                     const cComp = datosSemanas[sem].completas.length;
@@ -463,7 +478,7 @@ async function ejecutarScrapingMoodle(modulo, orientacion, anio, periodo) {
                 console.error(`Error procesando alumno ${al.nombre_completo}:`, errAl.message);
             }
         }
-        estadoBot = { ejecutando: false, progreso: '¡Seguimiento completado con éxito!', procesados: alumnos.length, total: alumnos.length };
+        estadoBot = { ejecutando: false, progreso: `¡Seguimiento completado (${alumnos.length} alumnos)!`, procesados: alumnos.length, total: alumnos.length };
     } catch (errGral) {
         console.error("Error general del bot:", errGral);
         estadoBot = { ejecutando: false, progreso: 'Error al ejecutar el bot', procesados: 0, total: 0 };
