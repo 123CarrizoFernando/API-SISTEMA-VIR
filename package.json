@@ -1,0 +1,19 @@
+{
+  "name": "api-sistema-vir",
+  "version": "2.0.0",
+  "description": "Backend Sistema Académico con Bot Integrado",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.8",
+    "axios-cookiejar-support": "^5.0.0",
+    "cheerio": "^1.0.0-rc.12",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "pg": "^8.11.5",
+    "tough-cookie": "^4.1.4"
+  }
+}
