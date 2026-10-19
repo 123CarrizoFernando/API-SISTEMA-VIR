@@ -82,6 +82,35 @@ app.post('/api/usuarios', async (req, res) => {
     }
 });
 
+// Editar un usuario existente o suspender/activar su cuenta por falta de pago
+app.put('/api/usuarios/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { username, password, nombre_completo, rol, sede, modulos_permitidos, activo } = req.body;
+        const result = await pool.query(
+            `UPDATE usuarios_sistema SET 
+                username = COALESCE($1, username),
+                password = COALESCE($2, password),
+                nombre_completo = COALESCE($3, nombre_completo),
+                rol = COALESCE($4, rol),
+                sede = COALESCE($5, sede),
+                modulos_permitidos = COALESCE($6, modulos_permitidos),
+                activo = COALESCE($7, activo)
+             WHERE id = $8 RETURNING *`,
+            [
+                username ? username.trim() : null, 
+                password ? password.trim() : null, 
+                nombre_completo ? nombre_completo.trim() : null, 
+                rol, sede, modulos_permitidos, activo, id
+            ]
+        );
+        res.json(result.rows[0]);
+    } catch (err) {
+        res.status(500).json({ error: 'Error al actualizar usuario: ' + err.message });
+    }
+});
+
+
 app.delete('/api/usuarios/:id', async (req, res) => {
     try {
         await pool.query("DELETE FROM usuarios_sistema WHERE id = $1 AND username != 'admin'", [req.params.id]);
