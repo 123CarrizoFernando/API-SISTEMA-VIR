@@ -19,21 +19,24 @@ const pool = new Pool({
 const SEMANAS_ORDEN = ["S02", "S03", "S04", "S07", "S08", "S11", "S12", "Evaluaciones"];
 const URL_LOGIN = "https://9002.edusalta.gov.ar/login/index.php";
 
-// Estado del bot en memoria para consultar desde el celular
 let estadoBot = { ejecutando: false, progreso: 'Inactivo', procesados: 0, total: 0 };
 
 // ============================================================================
-// 1. GESTIÓN DE ALUMNOS (Listar, Agregar, Editar, Borrar)
+// 1. GESTIÓN DE ALUMNOS, ESTADO ACADÉMICO E HISTORIAL POR PERÍODOS
 // ============================================================================
 
-// Obtener alumnos de una cursada
 app.get('/api/alumnos_cursada', async (req, res) => {
     try {
         const { modulo, orientacion, anio = 2026, periodo = '2° Período' } = req.query;
         const query = `
             SELECT a.id as alumno_id, a.dni, a.contrasena_moodle, a.nombre_completo, a.email, a.telefono,
                    a.doc_dni, a.doc_foto_carnet, a.doc_certificado_residencia, a.doc_constancia_pase, a.doc_pase_legalizado, a.doc_certificado_septimo,
-                   c.id as cursada_id, c.numero_modulo, c.orientacion, c.debe_defensa, c.seguimiento_semanal, c.resumen_texto
+                   COALESCE(a.modulos_adeudados, '') as modulos_adeudados, COALESCE(a.egresado, FALSE) as egresado,
+                   c.id as cursada_id, c.numero_modulo, c.orientacion, c.anio, c.periodo,
+                   c.debe_defensa, COALESCE(c.condicion, 'Cursando') as condicion,
+                   COALESCE(c.notificado_libre, FALSE) as notificado_libre,
+                   COALESCE(c.presento_nota_recursar, FALSE) as presento_nota_recursar,
+                   c.seguimiento_semanal, c.resumen_texto
             FROM alumnos a
             JOIN cursadas_modulos c ON a.id = c.alumno_id
             WHERE a.estado_general = 'Activo'
@@ -51,14 +54,63 @@ app.get('/api/alumnos_cursada', async (req, res) => {
     }
 });
 
-// Crear nuevo alumno y asignarlo al módulo/orientación actual
+// Historial completo de un alumno en todos los años y períodos
+app.get('/api/alumno/:id/historial', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const result = await pool.query(
+            `SELECT id as cursada_id, numero_modulo, orientacion, anio, periodo, 
+                    COALESCE(condicion, 'Cursando') as condicion, debe_defensa, 
+                    notificado_libre, presento_nota_recursar, resumen_texto
+             FROM cursadas_modulos 
+             WHERE alumno_id = $1 
+             ORDER BY anio DESC, periodo DESC, numero_modulo DESC`,
+            [id]
+        );
+        res.json(result.rows);
+    } catch (err) {
+        res.status(500).json({ error: 'Error al obtener historial' });
+    }
+});
+
+// Actualizar Tarjeta Académica Rápida (Condición, Módulos Adeudados, Libre/Nota, Egreso)
+app.put('/api/cursada/:cursada_id/estado_academico', async (req, res) => {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const { cursada_id } = req.params;
+        const { alumno_id, condicion, debe_defensa, notificado_libre, presento_nota_recursar, modulos_adeudados, egresado } = req.body;
+
+        await client.query(
+            `UPDATE cursadas_modulos SET 
+                condicion = $1, debe_defensa = $2, notificado_libre = $3, presento_nota_recursar = $4
+             WHERE id = $5`,
+            [condicion, debe_defensa, notificado_libre, presento_nota_recursar, cursada_id]
+        );
+
+        await client.query(
+            `UPDATE alumnos SET modulos_adeudados = $1, egresado = $2 WHERE id = $3`,
+            [modulos_adeudados || '', egresado || false, alumno_id]
+        );
+
+        await client.query('COMMIT');
+        res.json({ mensaje: 'Estado académico actualizado correctamente' });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err);
+        res.status(500).json({ error: 'Error al actualizar estado académico' });
+    } finally {
+        client.release();
+    }
+});
+
+// Crear 1 alumno
 app.post('/api/alumnos', async (req, res) => {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
         const { dni, nombre_completo, contrasena_moodle, email, telefono, numero_modulo, orientacion, anio = 2026, periodo = '2° Período' } = req.body;
 
-        // 1. Insertar o actualizar en tabla alumnos
         const resAlumno = await client.query(
             `INSERT INTO alumnos (dni, nombre_completo, contrasena_moodle, email, telefono, estado_general)
              VALUES ($1, $2, $3, $4, $5, 'Activo')
@@ -71,7 +123,6 @@ app.post('/api/alumnos', async (req, res) => {
         );
         const alumnoId = resAlumno.rows[0].id;
 
-        // 2. Verificar si ya está en esta cursada, si no, insertarlo
         const checkCursada = await client.query(
             `SELECT id FROM cursadas_modulos WHERE alumno_id = $1 AND numero_modulo = $2 AND orientacion = $3 AND anio = $4 AND periodo = $5`,
             [alumnoId, numero_modulo, orientacion, anio, periodo]
@@ -79,24 +130,76 @@ app.post('/api/alumnos', async (req, res) => {
 
         if (checkCursada.rows.length === 0) {
             await client.query(
-                `INSERT INTO cursadas_modulos (alumno_id, numero_modulo, orientacion, anio, periodo, debe_defensa)
-                 VALUES ($1, $2, $3, $4, $5, FALSE)`,
+                `INSERT INTO cursadas_modulos (alumno_id, numero_modulo, orientacion, anio, periodo, debe_defensa, condicion)
+                 VALUES ($1, $2, $3, $4, $5, FALSE, 'Cursando')`,
                 [alumnoId, numero_modulo, orientacion, anio, periodo]
             );
         }
 
         await client.query('COMMIT');
-        res.json({ mensaje: 'Alumno registrado correctamente', alumno_id: alumnoId });
+        res.json({ mensaje: 'Alumno registrado', alumno_id: alumnoId });
     } catch (err) {
         await client.query('ROLLBACK');
-        console.error(err);
         res.status(500).json({ error: 'Error al registrar alumno' });
     } finally {
         client.release();
     }
 });
 
-// Editar datos básicos, documentación y estado de defensa del alumno
+// Carga masiva de alumnos (O usado para pasar alumnos de un período a otro conservando el historial)
+app.post('/api/alumnos/masivo', async (req, res) => {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const { alumnos, numero_modulo, orientacion, anio = 2026, periodo = '2° Período' } = req.body;
+        let procesados = 0;
+
+        for (const al of alumnos) {
+            if (!al.dni || !al.nombre_completo) continue;
+            const dniLimpio = String(al.dni).replace(/\./g, '').trim();
+            const nombreLimpio = String(al.nombre_completo).trim().toUpperCase();
+            const claveLimpia = (al.contrasena_moodle && String(al.contrasena_moodle).trim() !== '') 
+                ? String(al.contrasena_moodle).trim() 
+                : dniLimpio;
+
+            const resAlumno = await client.query(
+                `INSERT INTO alumnos (dni, nombre_completo, contrasena_moodle, estado_general)
+                 VALUES ($1, $2, $3, 'Activo')
+                 ON CONFLICT (dni) DO UPDATE SET 
+                    nombre_completo = EXCLUDED.nombre_completo,
+                    contrasena_moodle = EXCLUDED.contrasena_moodle,
+                    estado_general = 'Activo'
+                 RETURNING id`,
+                [dniLimpio, nombreLimpio, claveLimpia]
+            );
+            const alumnoId = resAlumno.rows[0].id;
+
+            const checkCursada = await client.query(
+                `SELECT id FROM cursadas_modulos WHERE alumno_id = $1 AND numero_modulo = $2 AND orientacion = $3 AND anio = $4 AND periodo = $5`,
+                [alumnoId, numero_modulo, orientacion, anio, periodo]
+            );
+
+            if (checkCursada.rows.length === 0) {
+                await client.query(
+                    `INSERT INTO cursadas_modulos (alumno_id, numero_modulo, orientacion, anio, periodo, debe_defensa, condicion)
+                     VALUES ($1, $2, $3, $4, $5, FALSE, 'Cursando')`,
+                    [alumnoId, numero_modulo, orientacion, anio, periodo]
+                );
+            }
+            procesados++;
+        }
+
+        await client.query('COMMIT');
+        res.json({ mensaje: `¡Se procesaron ${procesados} alumnos en ${anio} (${periodo} - Mód. ${numero_modulo})!`, cantidad: procesados });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        res.status(500).json({ error: 'Error en carga masiva: ' + err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// Editar Legajo Administrativo (Papeles y Datos Personales)
 app.put('/api/alumno/:id', async (req, res) => {
     const client = await pool.connect();
     try {
@@ -127,36 +230,30 @@ app.put('/api/alumno/:id', async (req, res) => {
         res.json({ mensaje: 'Legajo actualizado correctamente' });
     } catch (err) {
         await client.query('ROLLBACK');
-        console.error(err);
         res.status(500).json({ error: 'Error al actualizar legajo' });
     } finally {
         client.release();
     }
 });
 
-// Eliminar un alumno de la cursada actual (o dar de baja)
 app.delete('/api/cursada/:cursada_id', async (req, res) => {
     try {
-        const { cursada_id } = req.params;
-        await pool.query('DELETE FROM cursadas_modulos WHERE id = $1', [cursada_id]);
-        res.json({ mensaje: 'Alumno eliminado del módulo correctamente' });
+        await pool.query('DELETE FROM cursadas_modulos WHERE id = $1', [req.params.cursada_id]);
+        res.json({ mensaje: 'Alumno eliminado de este período' });
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: 'Error al eliminar alumno de la cursada' });
+        res.status(500).json({ error: 'Error al eliminar alumno' });
     }
 });
 
 // ============================================================================
-// 2. ENLACES Y CONFIGURACIÓN DE MOODLE
+// 2. ENLACES MOODLE
 // ============================================================================
 
 app.get('/api/actividades', async (req, res) => {
     try {
         const { modulo, orientacion } = req.query;
         const result = await pool.query(
-            `SELECT * FROM actividades_moodle 
-             WHERE numero_modulo = $1 AND orientacion = $2 AND activa = TRUE 
-             ORDER BY semana ASC, materia ASC`,
+            `SELECT * FROM actividades_moodle WHERE numero_modulo = $1 AND orientacion = $2 AND activa = TRUE ORDER BY semana ASC, materia ASC`,
             [modulo, orientacion]
         );
         res.json(result.rows);
@@ -168,35 +265,26 @@ app.get('/api/actividades', async (req, res) => {
 app.post('/api/actividades', async (req, res) => {
     try {
         const { numero_modulo, orientacion, semana, materia, tipo_actividad, url_actividad } = req.body;
-        
-        // 1. Verificamos si ya existe una actividad para ese módulo, orientación, semana y materia
         const existe = await pool.query(
-            `SELECT id FROM actividades_moodle 
-             WHERE numero_modulo = $1 AND orientacion = $2 AND semana = $3 AND materia = $4`,
+            `SELECT id FROM actividades_moodle WHERE numero_modulo = $1 AND orientacion = $2 AND semana = $3 AND materia = $4`,
             [numero_modulo, orientacion, semana, materia]
         );
 
         let result;
         if (existe.rows.length > 0) {
-            // Si ya existe, la actualizamos
             result = await pool.query(
-                `UPDATE actividades_moodle 
-                 SET tipo_actividad = $1, url_actividad = $2, activa = TRUE 
-                 WHERE id = $3 RETURNING *`,
+                `UPDATE actividades_moodle SET tipo_actividad = $1, url_actividad = $2, activa = TRUE WHERE id = $3 RETURNING *`,
                 [tipo_actividad, url_actividad, existe.rows[0].id]
             );
         } else {
-            // Si no existe, la insertamos
             result = await pool.query(
                 `INSERT INTO actividades_moodle (numero_modulo, orientacion, semana, materia, tipo_actividad, url_actividad, activa)
                  VALUES ($1, $2, $3, $4, $5, $6, TRUE) RETURNING *`,
                 [numero_modulo, orientacion, semana, materia, tipo_actividad, url_actividad]
             );
         }
-
         res.json(result.rows[0]);
     } catch (err) {
-        console.error("Error en POST /api/actividades:", err);
         res.status(500).json({ error: err.message });
     }
 });
@@ -223,15 +311,15 @@ app.get('/api/config_curso', async (req, res) => {
 app.post('/api/config_curso', async (req, res) => {
     try {
         const { numero_modulo, orientacion, url_calificaciones } = req.body;
-        await pool.query(
-            `INSERT INTO config_cursos_moodle (numero_modulo, orientacion, url_calificaciones)
-             VALUES ($1, $2, $3)
-             ON CONFLICT (numero_modulo, orientacion) DO UPDATE SET url_calificaciones = EXCLUDED.url_calificaciones`,
-            [numero_modulo, orientacion, url_calificaciones]
-        );
-        res.json({ mensaje: 'URL de calificaciones guardada' });
+        const existe = await pool.query('SELECT id FROM config_cursos_moodle WHERE numero_modulo = $1 AND orientacion = $2', [numero_modulo, orientacion]);
+        if (existe.rows.length > 0) {
+            await pool.query('UPDATE config_cursos_moodle SET url_calificaciones = $1 WHERE id = $2', [url_calificaciones, existe.rows[0].id]);
+        } else {
+            await pool.query('INSERT INTO config_cursos_moodle (numero_modulo, orientacion, url_calificaciones) VALUES ($1, $2, $3)', [numero_modulo, orientacion, url_calificaciones]);
+        }
+        res.json({ mensaje: 'URL guardada' });
     } catch (err) {
-        res.status(500).json({ error: 'Error al guardar URL de calificaciones' });
+        res.status(500).json({ error: 'Error al guardar URL' });
     }
 });
 
@@ -251,8 +339,7 @@ app.get('/api/grupos', async (req, res) => {
             LEFT JOIN grupo_integrantes gi ON g.id = gi.grupo_id
             LEFT JOIN alumnos a ON gi.alumno_id = a.id
             WHERE g.numero_modulo = $1 AND g.orientacion = $2 AND g.anio = $3 AND g.periodo = $4
-            GROUP BY g.id 
-            ORDER BY g.nombre_grupo ASC
+            GROUP BY g.id ORDER BY g.nombre_grupo ASC
         `;
         const result = await pool.query(query, [modulo, orientacion, anio, periodo]);
         res.json(result.rows);
@@ -265,8 +352,7 @@ app.post('/api/grupos', async (req, res) => {
     try {
         const { numero_modulo, orientacion, anio = 2026, periodo = '2° Período', nombre_grupo } = req.body;
         const result = await pool.query(
-            `INSERT INTO grupos_proyecto (numero_modulo, orientacion, anio, periodo, nombre_grupo)
-             VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+            `INSERT INTO grupos_proyecto (numero_modulo, orientacion, anio, periodo, nombre_grupo) VALUES ($1, $2, $3, $4, $5) RETURNING *`,
             [numero_modulo, orientacion, anio, periodo, nombre_grupo]
         );
         res.json(result.rows[0]);
@@ -289,11 +375,9 @@ app.post('/api/grupo/agregar_alumno', async (req, res) => {
     try {
         const { grupo_id, alumno_id } = req.body;
         const countRes = await pool.query('SELECT count(*) FROM grupo_integrantes WHERE grupo_id = $1', [grupo_id]);
-        if (parseInt(countRes.rows[0].count) >= 4) {
-            return res.status(400).json({ error: 'El grupo ya alcanzó el límite de 4 integrantes.' });
-        }
+        if (parseInt(countRes.rows[0].count) >= 4) return res.status(400).json({ error: 'El grupo ya tiene 4 integrantes.' });
         await pool.query('INSERT INTO grupo_integrantes (grupo_id, alumno_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [grupo_id, alumno_id]);
-        res.json({ mensaje: 'Alumno agregado exitosamente' });
+        res.json({ mensaje: 'Alumno agregado' });
     } catch (err) {
         res.status(500).json({ error: 'Error al agregar alumno' });
     }
@@ -301,9 +385,8 @@ app.post('/api/grupo/agregar_alumno', async (req, res) => {
 
 app.delete('/api/grupo/quitar_alumno/:grupo_id/:alumno_id', async (req, res) => {
     try {
-        const { grupo_id, alumno_id } = req.params;
-        await pool.query('DELETE FROM grupo_integrantes WHERE grupo_id = $1 AND alumno_id = $2', [grupo_id, alumno_id]);
-        res.json({ mensaje: 'Alumno retirado del grupo' });
+        await pool.query('DELETE FROM grupo_integrantes WHERE grupo_id = $1 AND alumno_id = $2', [req.params.grupo_id, req.params.alumno_id]);
+        res.json({ mensaje: 'Alumno retirado' });
     } catch (err) {
         res.status(500).json({ error: 'Error al quitar alumno' });
     }
@@ -314,10 +397,8 @@ app.put('/api/grupos/:id', async (req, res) => {
         const { id } = req.params;
         const { tema_proyecto, instancia_1, instancia_2, instancia_3, instancia_recuperacion, estado_defensa, nota_final, observaciones_grupo } = req.body;
         await pool.query(
-            `UPDATE grupos_proyecto SET 
-             tema_proyecto = $1, instancia_1 = $2, instancia_2 = $3, instancia_3 = $4, 
-             instancia_recuperacion = $5, estado_defensa = $6, nota_final = $7, observaciones_grupo = $8
-             WHERE id = $9`,
+            `UPDATE grupos_proyecto SET tema_proyecto = $1, instancia_1 = $2, instancia_2 = $3, instancia_3 = $4, 
+             instancia_recuperacion = $5, estado_defensa = $6, nota_final = $7, observaciones_grupo = $8 WHERE id = $9`,
             [tema_proyecto, instancia_1, instancia_2, instancia_3, instancia_recuperacion, estado_defensa, nota_final, observaciones_grupo, id]
         );
         res.json({ mensaje: 'Notas actualizadas' });
@@ -326,53 +407,69 @@ app.put('/api/grupos/:id', async (req, res) => {
     }
 });
 
+// ============================================================================
+// 4. BOT MOODLE (CON SELECCIÓN DE ALUMNOS Y BOTÓN DE DESBLOQUEO)
+// ============================================================================
+
+app.get('/api/bot/estado', (req, res) => {
+    res.json(estadoBot);
+});
+
+app.post('/api/bot/cancelar', (req, res) => {
+    estadoBot = { ejecutando: false, progreso: 'Bot reiniciado manualmente.', procesados: 0, total: 0 };
+    res.json({ mensaje: 'Bot desbloqueado' });
+});
+
 app.post('/api/ejecutar_bot', async (req, res) => {
-    if (estadoBot.ejecutando) {
+    const { modulo, orientacion, anio = 2026, periodo = '2° Período', cursada_ids = [], forzar = false } = req.body;
+
+    if (estadoBot.ejecutando && !forzar) {
         return res.status(400).json({ error: 'El bot ya se está ejecutando en este momento.' });
     }
 
-    // Ahora recibimos también "cursada_ids" (lista opcional de alumnos seleccionados)
-    const { modulo, orientacion, anio = 2026, periodo = '2° Período', cursada_ids } = req.body;
-    res.json({ mensaje: 'Bot iniciado en segundo plano' });
-
+    res.json({ mensaje: 'Bot iniciado' });
     ejecutarScrapingMoodle(modulo, orientacion, anio, periodo, cursada_ids);
 });
 
-async function ejecutarScrapingMoodle(modulo, orientacion, anio, periodo, cursadaIds = null) {
-    estadoBot = { ejecutando: true, progreso: 'Iniciando barrido...', procesados: 0, total: 0 };
+function extraerMateriaLimpia(textoFila) {
+    const l = textoFila.toLowerCase();
+    if (l.includes('sociales') || l.includes('cs. soc')) return 'Cs. Sociales';
+    if (l.includes('naturales') || l.includes('cs. nat')) return 'Cs. Naturales';
+    if (l.includes('matem')) return 'Matemática';
+    if (l.includes('lengua')) return 'Lengua';
+    if (l.includes('fpt') || l.includes('formaci')) return 'FpT';
+    return textoFila.split(/[_-]/)[0].replace(/CUESTIONARIO|TAREA/gi, '').trim().substring(0, 20);
+}
+
+async function ejecutarScrapingMoodle(modulo, orientacion, anio, periodo, cursadaIds) {
+    estadoBot = { ejecutando: true, progreso: 'Preparando lista de alumnos...', procesados: 0, total: 0 };
     try {
-        let queryAlumnos = `
+        let query = `
             SELECT a.dni, a.contrasena_moodle, a.nombre_completo, c.id as cursada_id
             FROM alumnos a JOIN cursadas_modulos c ON a.id = c.alumno_id
             WHERE a.estado_general = 'Activo' AND c.numero_modulo = $1 AND c.orientacion = $2 AND c.anio = $3 AND c.periodo = $4
         `;
         let params = [modulo, orientacion, anio, periodo];
 
-        // Si desde la App elegiste a 1 o varios alumnos puntuales, filtramos solo esos:
+        // Si el usuario seleccionó alumnos específicos en la App, filtramos solo esos
         if (Array.isArray(cursadaIds) && cursadaIds.length > 0) {
-            queryAlumnos += ` AND c.id = ANY($5::int[])`;
+            query += ` AND c.id = ANY($5::int[])`;
             params.push(cursadaIds);
         }
+        query += ` ORDER BY a.nombre_completo ASC`;
 
-        queryAlumnos += ` ORDER BY a.nombre_completo ASC`;
-
-        const resAlumnos = await pool.query(queryAlumnos, params);
+        const resAlumnos = await pool.query(query, params);
         const alumnos = resAlumnos.rows;
         estadoBot.total = alumnos.length;
 
-        const resAct = await pool.query(
-            `SELECT * FROM actividades_moodle WHERE numero_modulo = $1 AND orientacion = $2 AND activa = TRUE`,
-            [modulo, orientacion]
-        );
+        const resAct = await pool.query(`SELECT * FROM actividades_moodle WHERE numero_modulo = $1 AND orientacion = $2 AND activa = TRUE`, [modulo, orientacion]);
         const actividadesDirectas = resAct.rows;
 
-        const resConf = await pool.query(
-            `SELECT url_calificaciones FROM config_cursos_moodle WHERE numero_modulo = $1 AND orientacion = $2`,
-            [modulo, orientacion]
-        );
+        const resConf = await pool.query(`SELECT url_calificaciones FROM config_cursos_moodle WHERE numero_modulo = $1 AND orientacion = $2`, [modulo, orientacion]);
         const urlCalificaciones = resConf.rows[0]?.url_calificaciones || 'https://9002.edusalta.gov.ar/grade/report/user/index.php?id=71';
 
         for (let i = 0; i < alumnos.length; i++) {
+            if (!estadoBot.ejecutando) break; // Permite frenar si se canceló manualmente
             const al = alumnos[i];
             estadoBot.progreso = `Procesando (${i + 1}/${alumnos.length}): ${al.nombre_completo}`;
             estadoBot.procesados = i + 1;
@@ -405,13 +502,11 @@ async function ejecutarScrapingMoodle(modulo, orientacion, anio, periodo, cursad
                         const textoFila = $grades(el).text().replace(/\s+/g, ' ').trim();
                         if (!textoFila || textoFila.includes('Cálculo total') || textoFila.includes('Total')) return;
 
-                        const semEncontrada = SEMANAS_ORDEN.find(sem => textoFila.includes(sem));
+                        const semEncontrada = SEMANAS_ORDEN.find(sem => textoFila.toUpperCase().includes(sem));
                         if (semEncontrada) {
-                            let materiaLimpia = textoFila.split('_')[0].replace(/CUESTIONARIO|TAREA/gi, '').trim();
-                            if (materiaLimpia.length > 25) materiaLimpia = materiaLimpia.substring(0, 25);
-
+                            const materiaLimpia = extraerMateriaLimpia(textoFila);
                             const simbolosOk = ["%", "✓", "✔", "✗", "✘"];
-                            const hecha = simbolosOk.some(s => textoFila.includes(s)) && !textoFila.includes("Vacío") && !textoFila.includes("-");
+                            const hecha = simbolosOk.some(s => textoFila.includes(s)) && !textoFila.includes("Vacío") && !textoFila.includes(" - ");
 
                             if (hecha) {
                                 if (!datosSemanas[semEncontrada].completas.includes(materiaLimpia)) datosSemanas[semEncontrada].completas.push(materiaLimpia);
@@ -438,11 +533,7 @@ async function ejecutarScrapingMoodle(modulo, orientacion, anio, periodo, cursad
 
                     const getAct = await client.get(urlAct);
                     const textoPag = cheerio.load(getAct.data)('body').text();
-
-                    const palabrasCompletado = [
-                        "Finalizado", "Enviado para calificar", "Archivos enviados", 
-                        "Texto en línea", "Calificación", "Hecho: Recibir una calificación", "Intentos: 1"
-                    ];
+                    const palabrasCompletado = ["Finalizado", "Enviado para calificar", "Archivos enviados", "Texto en línea", "Calificación", "Hecho: Recibir una calificación", "Intentos: 1"];
 
                     if (palabrasCompletado.some(p => textoPag.includes(p))) {
                         datosSemanas[sem].completas.push(mat);
@@ -473,26 +564,20 @@ async function ejecutarScrapingMoodle(modulo, orientacion, anio, periodo, cursad
                     `UPDATE cursadas_modulos SET seguimiento_semanal = $1, resumen_texto = $2, ultima_actualizacion_bot = CURRENT_TIMESTAMP WHERE id = $3`,
                     [datosSemanas, resumenFinal, al.cursada_id]
                 );
-
             } catch (errAl) {
-                console.error(`Error procesando alumno ${al.nombre_completo}:`, errAl.message);
+                console.error(`Error con ${al.nombre_completo}:`, errAl.message);
             }
         }
-        estadoBot = { ejecutando: false, progreso: `¡Seguimiento completado (${alumnos.length} alumnos)!`, procesados: alumnos.length, total: alumnos.length };
+        estadoBot = { ejecutando: false, progreso: '¡Seguimiento completado!', procesados: alumnos.length, total: alumnos.length };
     } catch (errGral) {
-        console.error("Error general del bot:", errGral);
         estadoBot = { ejecutando: false, progreso: 'Error al ejecutar el bot', procesados: 0, total: 0 };
     }
 }
 
-// Endpoint manual por si seguís usando el script de Python en PC
 app.put('/api/seguimiento', async (req, res) => {
     try {
         const { cursada_id, seguimiento_json, resumen_texto } = req.body;
-        await pool.query(
-            `UPDATE cursadas_modulos SET seguimiento_semanal = $1, resumen_texto = $2, ultima_actualizacion_bot = CURRENT_TIMESTAMP WHERE id = $3`,
-            [seguimiento_json, resumen_texto, cursada_id]
-        );
+        await pool.query(`UPDATE cursadas_modulos SET seguimiento_semanal = $1, resumen_texto = $2, ultima_actualizacion_bot = CURRENT_TIMESTAMP WHERE id = $3`, [seguimiento_json, resumen_texto, cursada_id]);
         res.json({ mensaje: 'Seguimiento actualizado' });
     } catch (err) {
         res.status(500).json({ error: 'Error al guardar seguimiento' });
@@ -500,6 +585,4 @@ app.put('/api/seguimiento', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`Servidor API corriendo en el puerto ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Servidor API corriendo en el puerto ${PORT}`));
