@@ -626,6 +626,7 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                 SEMANAS_ORDEN.forEach(s => datosSemanas[s] = { completas: [], faltan: [] });
 
                 // PASO A: Tabla General de Calificaciones
+                // PASO A: Tabla General de Calificaciones
                 if (urlCalificaciones) {
                     const getGrades = await client.get(urlCalificaciones);
                     const $grades = cheerio.load(getGrades.data);
@@ -637,6 +638,8 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                         const semEncontrada = SEMANAS_ORDEN.find(sem => textoFila.toUpperCase().includes(sem));
                         if (semEncontrada) {
                             const materiaLimpia = extraerMateriaLimpia(textoFila);
+                            if (!materiaLimpia) return; // Si no es una de las 5 materias, la descarta
+
                             const simbolosOk = ["%", "✓", "✔", "✗", "✘"];
                             const hecha = simbolosOk.some(s => textoFila.includes(s)) && !textoFila.includes("Vacío") && !textoFila.includes(" - ");
 
@@ -644,7 +647,6 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                                 if (!datosSemanas[semEncontrada].completas.some(m => mismaMateria(m, materiaLimpia))) {
                                     datosSemanas[semEncontrada].completas.push(materiaLimpia);
                                 }
-                                // Si apareció hecha en otra fila de la misma materia, la quitamos de faltan
                                 datosSemanas[semEncontrada].faltan = datosSemanas[semEncontrada].faltan.filter(m => !mismaMateria(m, materiaLimpia));
                             } else {
                                 if (!datosSemanas[semEncontrada].faltan.some(m => mismaMateria(m, materiaLimpia)) &&
@@ -718,9 +720,14 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                     }
                 }
 
-                // PASO C: Armar texto de resumen y guardar en Neon
+               // PASO C: Limpieza cruzada de seguridad y armado de texto
                 let detallesTexto = [];
                 for (const sem of SEMANAS_ORDEN) {
+                    // Regla de oro: Si una materia está en 'completas' (o tiene enlaces directos de todas las materias), jamás puede quedar en 'faltan'
+                    datosSemanas[sem].faltan = datosSemanas[sem].faltan.filter(
+                        f => !datosSemanas[sem].completas.some(c => mismaMateria(c, f))
+                    );
+
                     const cComp = datosSemanas[sem].completas.length;
                     const cFalt = datosSemanas[sem].faltan.length;
                     if (cComp > 0 || cFalt > 0) {
