@@ -525,28 +525,19 @@ app.post('/api/ejecutar_bot', async (req, res) => {
 });
 
 // Reconoce cualquier abreviatura de Moodle (ej: "MAT_S02", "CS. SOC", "NAT", "FPT") y la devuelve con el nombre oficial
+// Solo devuelve una de las 5 materias oficiales (o null si es una fila basura de Moodle)
 function extraerMateriaLimpia(textoFila) {
-    const prefijo = textoFila.split(/[_-]/)[0].replace(/CUESTIONARIO|TAREA|FORO/gi, '').trim();
-    const l = prefijo.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+    const l = String(textoFila || '').toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
 
-    if (l.includes('soc')) return 'Cs. Sociales';
-    if (l.includes('nat')) return 'Cs. Naturales';
-    if (l.includes('mat')) return 'Matemática';
-    if (l.includes('len')) return 'Lengua';
-    if (l.includes('fpt') || l.includes('formaci') || l.includes('trab')) return 'FpT';
+    if (l.includes('social') || l.includes('cs. soc') || l.includes('cs soc') || /\bsoc[_\s-]/.test(l)) return 'Cs. Sociales';
+    if (l.includes('natural') || l.includes('cs. nat') || l.includes('cs nat') || /\bnat[_\s-]/.test(l)) return 'Cs. Naturales';
+    if (l.includes('matem') || /\bmat[_\s-]/.test(l) || /\bmate[_\s-]/.test(l)) return 'Matemática';
+    if (l.includes('lengua') || /\blen[_\s-]/.test(l) || /\bleng[_\s-]/.test(l)) return 'Lengua';
+    if (l.includes('fpt') || l.includes('formaci') || l.includes('trabajo')) return 'FpT';
 
-    // Si en el resto de la fila dice el nombre de la materia
-    const filaCompleta = textoFila.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-    if (filaCompleta.includes('sociales') || filaCompleta.includes('cs. soc')) return 'Cs. Sociales';
-    if (filaCompleta.includes('naturales') || filaCompleta.includes('cs. nat')) return 'Cs. Naturales';
-    if (filaCompleta.includes('matem') || /\bmat\b/.test(filaCompleta)) return 'Matemática';
-    if (filaCompleta.includes('lengua')) return 'Lengua';
-    if (filaCompleta.includes('fpt') || filaCompleta.includes('formacion para el trabajo')) return 'FpT';
-
-    return prefijo.substring(0, 20);
+    return null; // Ignora filas raras que no sean una de las 5 materias reales
 }
 
-// Compara dos nombres de materias ignorando tildes y abreviaturas (para que "mat" sea igual a "Matemática")
 function mismaMateria(matA, matB) {
     const canon = (s) => {
         const l = String(s || '').toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
@@ -554,7 +545,7 @@ function mismaMateria(matA, matB) {
         if (l.includes('soc')) return 'sociales';
         if (l.includes('nat')) return 'naturales';
         if (l.includes('len')) return 'lengua';
-        if (l.includes('fpt') || l.includes('trab')) return 'fpt';
+        if (l.includes('fpt') || l.includes('trab') || l.includes('formaci')) return 'fpt';
         return l.replace(/[^a-z]/g, '');
     };
     return canon(matA) === canon(matB);
