@@ -82,7 +82,6 @@ app.post('/api/usuarios', async (req, res) => {
     }
 });
 
-// Editar un usuario existente o suspender/activar su cuenta por falta de pago
 app.put('/api/usuarios/:id', async (req, res) => {
     try {
         const { id } = req.params;
@@ -109,7 +108,6 @@ app.put('/api/usuarios/:id', async (req, res) => {
         res.status(500).json({ error: 'Error al actualizar usuario: ' + err.message });
     }
 });
-
 
 app.delete('/api/usuarios/:id', async (req, res) => {
     try {
@@ -503,7 +501,7 @@ app.put('/api/grupos/:id', async (req, res) => {
 });
 
 // ============================================================================
-// 4. BOT MOODLE (AISLADO POR SEDE Y SELECCIÓN DE ALUMNOS)
+// 4. BOT MOODLE (CORREGIDO RECONOCIMIENTO DE 'MAT' Y PRIORIDAD DE ENLACES)
 // ============================================================================
 
 app.get('/api/bot/estado', (req, res) => {
@@ -526,20 +524,40 @@ app.post('/api/ejecutar_bot', async (req, res) => {
     ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, cursada_ids);
 });
 
-// Función normalizadora que unifica nombres con o sin tilde para que nunca queden duplicados
+// Reconoce cualquier abreviatura de Moodle (ej: "MAT_S02", "CS. SOC", "NAT", "FPT") y la devuelve con el nombre oficial
 function extraerMateriaLimpia(textoFila) {
-    const l = textoFila.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, ""); // Quita tildes
-    if (l.includes('sociales') || l.includes('cs. soc') || l.includes('soc')) return 'Cs. Sociales';
-    if (l.includes('naturales') || l.includes('cs. nat') || l.includes('nat')) return 'Cs. Naturales';
-    if (l.includes('matem')) return 'Matemática';
-    if (l.includes('lengua')) return 'Lengua';
-    if (l.includes('fpt') || l.includes('formaci') || l.includes('trabajo')) return 'FpT';
-    return textoFila.split(/[_-]/)[0].replace(/CUESTIONARIO|TAREA/gi, '').trim().substring(0, 20);
+    const prefijo = textoFila.split(/[_-]/)[0].replace(/CUESTIONARIO|TAREA|FORO/gi, '').trim();
+    const l = prefijo.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+
+    if (l.includes('soc')) return 'Cs. Sociales';
+    if (l.includes('nat')) return 'Cs. Naturales';
+    if (l.includes('mat')) return 'Matemática';
+    if (l.includes('len')) return 'Lengua';
+    if (l.includes('fpt') || l.includes('formaci') || l.includes('trab')) return 'FpT';
+
+    // Si en el resto de la fila dice el nombre de la materia
+    const filaCompleta = textoFila.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+    if (filaCompleta.includes('sociales') || filaCompleta.includes('cs. soc')) return 'Cs. Sociales';
+    if (filaCompleta.includes('naturales') || filaCompleta.includes('cs. nat')) return 'Cs. Naturales';
+    if (filaCompleta.includes('matem') || /\bmat\b/.test(filaCompleta)) return 'Matemática';
+    if (filaCompleta.includes('lengua')) return 'Lengua';
+    if (filaCompleta.includes('fpt') || filaCompleta.includes('formacion para el trabajo')) return 'FpT';
+
+    return prefijo.substring(0, 20);
 }
 
+// Compara dos nombres de materias ignorando tildes y abreviaturas (para que "mat" sea igual a "Matemática")
 function mismaMateria(matA, matB) {
-    const limpiar = (s) => String(s || '').toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z]/g, '');
-    return limpiar(matA) === limpiar(matB);
+    const canon = (s) => {
+        const l = String(s || '').toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+        if (l.includes('mat')) return 'matematica';
+        if (l.includes('soc')) return 'sociales';
+        if (l.includes('nat')) return 'naturales';
+        if (l.includes('len')) return 'lengua';
+        if (l.includes('fpt') || l.includes('trab')) return 'fpt';
+        return l.replace(/[^a-z]/g, '');
+    };
+    return canon(matA) === canon(matB);
 }
 
 async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, cursadaIds) {
@@ -593,7 +611,7 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                 const $login = cheerio.load(getLogin.data);
                 const logintoken = $login('input[name="logintoken"]').val() || '';
 
-                // 2. Iniciar sesión
+                // 2. Iniciar sesión en Moodle
                 const formParams = new URLSearchParams();
                 formParams.append('username', String(al.dni).trim());
                 formParams.append('password', String(al.contrasena_moodle).trim());
@@ -603,7 +621,6 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                     headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
                 });
 
-                // Verificar si el login falló (para no pisar datos buenos con falsos "Falta realizar")
                 const htmlPostLogin = String(postLogin.data || '');
                 if (htmlPostLogin.includes('loginerrors') || htmlPostLogin.includes('Acceso inválido') || htmlPostLogin.includes('Invalid login')) {
                     const msgError = `${al.nombre_completo.toUpperCase()}: ⚠️ Usuario o contraseña de Moodle incorrectos`;
@@ -617,7 +634,7 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                 let datosSemanas = {};
                 SEMANAS_ORDEN.forEach(s => datosSemanas[s] = { completas: [], faltan: [] });
 
-                // PASO A: Tabla General de Calificaciones (Solo para materias que NO tengan enlace directo configurado)
+                // PASO A: Tabla General de Calificaciones
                 if (urlCalificaciones) {
                     const getGrades = await client.get(urlCalificaciones);
                     const $grades = cheerio.load(getGrades.data);
@@ -636,6 +653,8 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                                 if (!datosSemanas[semEncontrada].completas.some(m => mismaMateria(m, materiaLimpia))) {
                                     datosSemanas[semEncontrada].completas.push(materiaLimpia);
                                 }
+                                // Si apareció hecha en otra fila de la misma materia, la quitamos de faltan
+                                datosSemanas[semEncontrada].faltan = datosSemanas[semEncontrada].faltan.filter(m => !mismaMateria(m, materiaLimpia));
                             } else {
                                 if (!datosSemanas[semEncontrada].faltan.some(m => mismaMateria(m, materiaLimpia)) &&
                                     !datosSemanas[semEncontrada].completas.some(m => mismaMateria(m, materiaLimpia))) {
@@ -646,14 +665,14 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                     });
                 }
 
-                // PASO B: Enlaces Directos por Semana (Prioridad absoluta, pisa cualquier versión con o sin tilde)
+                // PASO B: Enlaces Directos por Semana (Pisa cualquier abreviatura de la tabla general como "mat")
                 for (const act of actividadesDirectas) {
                     const sem = act.semana;
                     const mat = act.materia;
                     const urlAct = act.url_actividad;
 
                     if (!datosSemanas[sem]) continue;
-                    // Eliminamos cualquier rastro previo de esta materia (con o sin tilde) en esa semana
+                    // Borramos de completas y faltan cualquier rastro previo de esta materia (incluso si decía "mat")
                     datosSemanas[sem].completas = datosSemanas[sem].completas.filter(m => !mismaMateria(m, mat));
                     datosSemanas[sem].faltan = datosSemanas[sem].faltan.filter(m => !mismaMateria(m, mat));
 
@@ -668,7 +687,6 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                         const textoPag = $act('body').text().replace(/\s+/g, ' ');
                         const textoPagLower = textoPag.toLowerCase();
 
-                        // Detectamos todas las variantes en las que Moodle informa que un cuestionario o tarea fue realizado
                         const palabrasCompletado = [
                             "finalizado",
                             "terminado",
@@ -681,7 +699,7 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                             "calificación:",
                             "hecho: recibir una calificación",
                             "hecho: ver",
-                            "intentos permitidos",
+                            "hecho:",
                             "resumen de sus intentos previos",
                             "revisión",
                             "revision",
@@ -689,8 +707,7 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                             "no se permiten más intentos"
                         ];
 
-                        // Verificamos si tiene tabla de intentos realizados (`generaltable` o `quizattemptsummary`) o palabras clave
-                        const tieneTablaIntentos = $act('table.quizattemptsummary').length > 0 || textoPagLower.includes('resumen de sus intentos');
+                        const tieneTablaIntentos = $act('table.quizattemptsummary').length > 0 \vert{}\vert{}$act('table.generaltable').length > 0 || textoPagLower.includes('resumen de sus intentos');
                         const diceNoRealizado = textoPagLower.includes('aún no se han realizado intentos') || textoPagLower.includes('no se han realizado intentos') || textoPagLower.includes('no entregado') || textoPagLower.includes('sin entregar');
 
                         let completada = false;
@@ -742,6 +759,19 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
         estadoBot = { ejecutando: false, progreso: 'Error al ejecutar el bot', procesados: 0, total: 0 };
     }
 }
+
+app.put('/api/seguimiento', async (req, res) => {
+    try {
+        const { cursada_id, seguimiento_json, resumen_texto } = req.body;
+        await pool.query(
+            `UPDATE cursadas_modulos SET seguimiento_semanal = $1, resumen_texto = $2, ultima_actualizacion_bot = CURRENT_TIMESTAMP WHERE id = $3`,
+            [seguimiento_json, resumen_texto, cursada_id]
+        );
+        res.json({ mensaje: 'Seguimiento actualizado' });
+    } catch (err) {
+        res.status(500).json({ error: 'Error al guardar seguimiento' });
+    }
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Servidor API corriendo en el puerto ${PORT}`));
