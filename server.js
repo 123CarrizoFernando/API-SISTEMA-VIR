@@ -499,7 +499,7 @@ app.put('/api/grupos/:id', async (req, res) => {
 });
 
 // ============================================================================
-// 4. BOT MOODLE CON SESIÓN COOKIE MANUAL Y DOBLE VERIFICACIÓN (CALIFICACIONES + LINKS)
+// 4. BOT MOODLE (SIN FALSOS ERRORES DE CLAVE Y CON DOBLE VERIFICACIÓN REAL)
 // ============================================================================
 
 app.get('/api/bot/estado', (req, res) => {
@@ -522,7 +522,6 @@ app.post('/api/ejecutar_bot', async (req, res) => {
     ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, cursada_ids);
 });
 
-// Reconoce la materia desde cualquier texto o nombre de fila en la tabla de calificaciones
 function extraerMateriaLimpia(textoFila) {
     const l = String(textoFila || '').toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
     if (l.includes('soc')) return 'Cs. Sociales';
@@ -533,7 +532,6 @@ function extraerMateriaLimpia(textoFila) {
     return null;
 }
 
-// Detecta a qué semana pertenece una fila de la tabla de calificaciones (soporta "S02", "S 02", "S2", "Sem 2", "Semana 2", "Eval")
 function detectarSemanaEnTexto(textoFila) {
     const t = String(textoFila || '').toUpperCase();
     if (/S\s*0?2\b|SEMANA\s*0?2\b/.test(t)) return 'S02';
@@ -560,23 +558,18 @@ function mismaMateria(matA, matB) {
     return canon(matA) === canon(matB);
 }
 
-// Extrae el parámetro id=XXXX de una URL de actividad de Moodle (para cruzarlo con la Tabla de Calificaciones)
 function extraerIdModuloUrl(url) {
     const match = String(url || '').match(/[?&]id=(\d+)/);
     return match ? match[1] : null;
 }
 
-/**
- * Evalúa si una fila de la Tabla General de Calificaciones (grade/report/user/index.php) está realizada,
- * usando la misma lógica probada del antiguo bot de Python (% / ✓ / ✔ / nota numérica y que no diga Vacío).
- */
+// Evalúa una fila de la Tabla General de Calificaciones (grade/report/user/index.php)
 function evaluarFilaTablaCalificaciones($grades, filaEl) {
     const textoFila = $grades(filaEl).text().replace(/\s+/g, ' ').trim();
     if (!textoFila || textoFila.includes('Cálculo total') || textoFila.includes('Total del curso')) {
         return { realizada: false, nota: null };
     }
 
-    // Buscar si tiene porcentaje (ej: "100,00 %" o "80.00 %") o nota numérica en la celda de calificación
     const celdaGrade = $grades(filaEl).find('td.column-grade, td.column-percentage').text().replace(/\s+/g, ' ').trim();
     const simbolosOk = ["%", "✓", "✔", "✗", "✘"];
 
@@ -591,11 +584,9 @@ function evaluarFilaTablaCalificaciones($grades, filaEl) {
         }
     }
 
-    // Respaldo exacto del antiguo bot de Python sobre toda la fila
     if (!realizada) {
         const tieneSimbolo = simbolosOk.some(s => textoFila.includes(s));
         const diceVacio = textoFila.includes('Vacío') || textoFila.includes('Vacio');
-        // En la tabla de Moodle, cuando no hizo nada suele aparecer "- -" (guiones en nota y porcentaje)
         if (tieneSimbolo && !diceVacio) {
             realizada = true;
             const matchPorc = textoFila.match(/([0-9]+[.,]?[0-9]*)\s*%/);
@@ -606,9 +597,7 @@ function evaluarFilaTablaCalificaciones($grades, filaEl) {
     return { realizada, nota };
 }
 
-/**
- * Analiza la página individual de un cuestionario o tarea (Segunda Verificación).
- */
+// Analiza la página individual de un cuestionario o tarea
 function analizarPaginaActividadMoodle(htmlCrudo) {
     const $ = cheerio.load(htmlCrudo);
 
@@ -624,13 +613,11 @@ function analizarPaginaActividadMoodle(htmlCrudo) {
 
     let notaExtraida = null;
 
-    // 1. "Su calificación final en este cuestionario es 10.00/10.00" o "Calificación más alta: 10.00"
     const matchCalifFinal = textoPlano.match(/calificaci[oó]n (?:final en este cuestionario es|m[aá]s alta:?)\s*([0-9]+[.,]?[0-9]*)/i);
     if (matchCalifFinal) {
         notaExtraida = matchCalifFinal[1];
     }
 
-    // 2. "Calificar 10.00 de 10.00" dentro de la tabla de intento
     if (!notaExtraida) {
         const matchCalificarDe = textoPlano.match(/calificar\s+([0-9]+[.,]?[0-9]*)\s+de\s+[0-9]+/i);
         if (matchCalificarDe) {
@@ -638,13 +625,11 @@ function analizarPaginaActividadMoodle(htmlCrudo) {
         }
     }
 
-    // 3. Bloque "Sus intentos" / "Intento 1" con "Estado Finalizado" o "Completado"
     const tieneSusIntentosFinalizado = (
         (textoLower.includes('sus intentos') || /intento\s+1/i.test(textoPlano) || textoLower.includes('resumen de sus intentos')) &&
         (/estado\s*finalizado/i.test(textoPlano) || /estado\s*terminado/i.test(textoPlano) || textoLower.includes('completado'))
     );
 
-    // 4. Chapita verde de Moodle que confirma calificación o envío (Ignorando "Hecho: Ver")
     const tieneChapitaCalificado = (
         textoLower.includes('hecho: recibir una calificaci') ||
         textoLower.includes('hecho: alcanzar la calificaci') ||
@@ -652,7 +637,6 @@ function analizarPaginaActividadMoodle(htmlCrudo) {
         textoLower.includes('hecho: realizar un intento')
     );
 
-    // 5. Tarea enviada
     const tieneTareaEntregada = (
         textoLower.includes('enviado para calificar') ||
         (textoLower.includes('estado de la entrega') && textoLower.includes('enviado'))
@@ -666,10 +650,13 @@ function analizarPaginaActividadMoodle(htmlCrudo) {
 }
 
 /**
- * Cliente HTTP con manejo manual de Cookies para que Moodle NUNCA pierda la sesión en redirecciones 303
+ * Cliente de Sesión Moodle con soporte para MoodleSession + MOODLEID1_ + redirecciones encadenadas.
+ * Verifica el login comprobando la existencia real de sesión activa (logout.php / usermenu) para NUNCA dar falsos errores de contraseña.
  */
 function crearSesionMoodle() {
-    const cookiesMap = {};
+    const cookiesMap = {
+        MoodleTestSession: 'enabled'
+    };
 
     const guardarCookies = (headers) => {
         if (!headers || !headers['set-cookie']) return;
@@ -680,7 +667,9 @@ function crearSesionMoodle() {
             if (eqIdx > 0) {
                 const nombre = par.substring(0, eqIdx).trim();
                 const valor = par.substring(eqIdx + 1).trim();
-                cookiesMap[nombre] = valor;
+                if (valor && valor !== 'deleted') {
+                    cookiesMap[nombre] = valor;
+                }
             }
         }
     };
@@ -689,7 +678,7 @@ function crearSesionMoodle() {
         return Object.entries(cookiesMap).map(([k, v]) => `${k}=${v}`).join('; ');
     };
 
-    const get = async (url, redireccionesRestantes = 5) => {
+    const get = async (url, redireccionesRestantes = 8) => {
         const resp = await axios.get(url, {
             maxRedirects: 0,
             validateStatus: (status) => status >= 200 && status < 400,
@@ -710,18 +699,17 @@ function crearSesionMoodle() {
         return resp;
     };
 
-    const postLogin = async (username, password) => {
-        // Paso 1: Entrar al login para recibir el primer MoodleSession y el logintoken
+    const intentarCredenciales = async (userStr, passStr) => {
         const getResp = await get(URL_LOGIN);
         const $login = cheerio.load(getResp.data);
         const logintoken = $login('input[name="logintoken"]').val() || '';
 
         const formParams = new URLSearchParams();
-        formParams.append('username', String(username).trim());
-        formParams.append('password', String(password).trim());
+        formParams.append('anchor', '');
         if (logintoken) formParams.append('logintoken', logintoken);
+        formParams.append('username', userStr);
+        formParams.append('password', passStr);
 
-        // Paso 2: Enviar el POST sin seguir redirecciones automáticas para capturar la nueva cookie MoodleSession
         const postResp = await axios.post(URL_LOGIN, formParams.toString(), {
             maxRedirects: 0,
             validateStatus: (status) => status >= 200 && status < 400,
@@ -736,26 +724,38 @@ function crearSesionMoodle() {
         });
         guardarCookies(postResp.headers);
 
-        // Paso 3: Seguir manualmente la redirección 303 de Moodle con la nueva cookie ya guardada
+        let paginaFinal = postResp;
         if (postResp.status >= 300 && postResp.status < 400 && postResp.headers.location) {
             const redirectUrl = new URL(postResp.headers.location, URL_LOGIN).toString();
-            if (redirectUrl.includes('login/index.php')) {
-                const checkErr = await get(redirectUrl);
-                const htmlErr = String(checkErr.data || '');
-                if (htmlErr.includes('loginerrors') || htmlErr.includes('Acceso inválido') || htmlErr.includes('Invalid login') || htmlErr.includes('logintoken')) {
-                    return { ok: false };
-                }
-            } else {
-                await get(redirectUrl);
-            }
-            return { ok: true };
+            paginaFinal = await get(redirectUrl);
         }
 
-        const htmlBody = String(postResp.data || '');
-        if (htmlBody.includes('loginerrors') || htmlBody.includes('Acceso inválido') || htmlBody.includes('logintoken')) {
-            return { ok: false };
+        const htmlFinal = String(paginaFinal.data || '');
+        const $final = cheerio.load(htmlFinal);
+
+        // Señales inequívocas de que el alumno YA ESTÁ LOGUEADO adentro de Moodle:
+        const tieneLogout = htmlFinal.includes('login/logout.php') || $final('a[href*="logout.php"]').length > 0;
+        const noTieneInputPass = $final('input[name="password"]').length === 0;
+
+        return tieneLogout || noTieneInputPass;
+    };
+
+    const postLogin = async (dniRaw, passRaw) => {
+        const dniLimpio = String(dniRaw || '').replace(/\./g, '').trim();
+        const passLimpia = String(passRaw || '').trim();
+
+        // Intento 1: Con los datos exactos cargados
+        if (await intentarCredenciales(dniLimpio, passLimpia)) return { ok: true };
+
+        // Intento 2: Si la clave tenía puntos o espacios, probamos con el DNI limpio como contraseña
+        if (passLimpia.replace(/\./g, '') !== passLimpia) {
+            if (await intentarCredenciales(dniLimpio, passLimpia.replace(/\./g, ''))) return { ok: true };
         }
-        return { ok: true };
+        if (passLimpia !== dniLimpio) {
+            if (await intentarCredenciales(dniLimpio, dniLimpio)) return { ok: true };
+        }
+
+        return { ok: false };
     };
 
     return { get, postLogin };
@@ -789,7 +789,7 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
         const actividadesDirectas = resAct.rows;
 
         const resConf = await pool.query(`SELECT url_calificaciones FROM config_cursos_moodle WHERE numero_modulo = $1 AND orientacion = $2`, [modulo, orientacion]);
-        const urlCalificaciones = resConf.rows[0]?.url_calificaciones || 'https://9002.edusalta.gov.ar/grade/report/user/index.php?id=71';
+        let urlCalificacionesConfigurada = resConf.rows[0]?.url_calificaciones || '';
 
         for (let i = 0; i < alumnos.length; i++) {
             if (!estadoBot.ejecutando) break;
@@ -802,7 +802,7 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                 const loginRes = await sesion.postLogin(al.dni, al.contrasena_moodle);
 
                 if (!loginRes.ok) {
-                    const msgError = `${al.nombre_completo.toUpperCase()}: ⚠️ Usuario o contraseña de Moodle incorrectos`;
+                    const msgError = `${al.nombre_completo.toUpperCase()}: ⚠️ Usuario o contraseña de Moodle incorrectos (DNI: ${al.dni})`;
                     await pool.query(
                         `UPDATE cursadas_modulos SET resumen_texto = $1, ultima_actualizacion_bot = CURRENT_TIMESTAMP WHERE id = $2`,
                         [msgError, al.cursada_id]
@@ -812,22 +812,51 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
 
                 let datosSemanas = {};
                 SEMANAS_ORDEN.forEach(s => datosSemanas[s] = { completas: [], faltan: [] });
-
-                // Mapa de calificaciones leídas en la Tabla General por ID de actividad (ej: id=11700 -> { realizada, nota })
                 const estadoPorIdEnTabla = {};
 
                 // ====================================================================
-                // VERIFICACIÓN 1: LEER LA TABLA GENERAL DE CALIFICACIONES (IGUAL AL BOT ANTIGUO + CRUCE POR ID DE ENLACE)
+                // PASO 1: VISITAR CADA ENLACE DIRECTO (Y DEDUCIR AUTOMÁTICAMENTE EL ID DEL CURSO SI HACE FALTA)
                 // ====================================================================
-                if (urlCalificaciones) {
+                let courseIdDetectado = null;
+                const resultadosDirectosPorActividad = {};
+
+                for (const act of actividadesDirectas) {
+                    const urlAct = act.url_actividad ? act.url_actividad.trim() : '';
+                    if (!urlAct || urlAct === 'Revisión_Manual') continue;
+
                     try {
-                        const getGrades = await sesion.get(urlCalificaciones);
+                        const respAct = await sesion.get(urlAct);
+                        const htmlAct = String(respAct.data || '');
+
+                        // Si aún no teníamos el ID del curso para la Tabla de Calificaciones, lo extraemos del menú del curso
+                        if (!courseIdDetectado) {
+                            const matchCourse = htmlAct.match(/course\/view\.php\?id=(\d+)/) || htmlAct.match(/grade\/report\/user\/index\.php\?id=(\d+)/);
+                            if (matchCourse) courseIdDetectado = matchCourse[1];
+                        }
+
+                        resultadosDirectosPorActividad[act.id] = analizarPaginaActividadMoodle(htmlAct);
+                    } catch (errLink) {
+                        resultadosDirectosPorActividad[act.id] = { realizada: false, nota: null };
+                    }
+                }
+
+                // ====================================================================
+                // PASO 2: LEER LA TABLA GENERAL DE CALIFICACIONES (DOBLE VERIFICACIÓN + REFERENCIA CRUZADA)
+                // ====================================================================
+                let urlTablaEfectiva = urlCalificacionesConfigurada;
+                if (!urlTablaEfectiva && courseIdDetectado) {
+                    urlTablaEfectiva = `https://9002.edusalta.gov.ar/grade/report/user/index.php?id=${courseIdDetectado}`;
+                }
+
+                if (urlTablaEfectiva) {
+                    try {
+                        const getGrades = await sesion.get(urlTablaEfectiva);
                         const $grades = cheerio.load(getGrades.data);
 
                         $grades('tr').each((_, el) => {
                             const evalFila = evaluarFilaTablaCalificaciones($grades, el);
 
-                            // A) Si la fila tiene un link con id=XXXX (ej: mod/quiz/view.php?id=11700), guardamos su estado exacto
+                            // A) Referencia cruzada exacta por el ID del enlace (ej: mod/quiz/view.php?id=11700)
                             $grades(el).find('a[href*="id="]').each((__, aTag) => {
                                 const href = $grades(aTag).attr('href') || '';
                                 const idMod = extraerIdModuloUrl(href);
@@ -836,7 +865,7 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                                 }
                             });
 
-                            // B) También leemos por nombre de Semana y Materia (igual que el bot antiguo de Python)
+                            // B) Lectura por nombre de Semana y Materia (igual al antiguo bot)
                             const textoFila = $grades(el).text().replace(/\s+/g, ' ').trim();
                             const semEncontrada = detectarSemanaEnTexto(textoFila);
                             const materiaLimpia = extraerMateriaLimpia(textoFila);
@@ -862,7 +891,7 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                 }
 
                 // ====================================================================
-                // VERIFICACIÓN 2: REVISAR CADA ENLACE DIRECTO Y COMBINAR CON LA TABLA DE CALIFICACIONES
+                // PASO 3: COMBINAR AMBAS VERIFICACIONES (ENLACE DIRECTO + TABLA DE CALIFICACIONES)
                 // ====================================================================
                 for (const act of actividadesDirectas) {
                     const sem = act.semana;
@@ -871,7 +900,6 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
 
                     if (!datosSemanas[sem] || !urlAct) continue;
 
-                    // Si ya es Actividad Colaborativa Manual, siempre es completa
                     if (urlAct === 'Revisión_Manual') {
                         datosSemanas[sem].completas = datosSemanas[sem].completas.filter(m => !mismaMateria(m, mat));
                         datosSemanas[sem].faltan = datosSemanas[sem].faltan.filter(m => !mismaMateria(m, mat));
@@ -879,25 +907,15 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                         continue;
                     }
 
-                    // 1. ¿Ya dio positivo en la Tabla General de Calificaciones (por ID de enlace o por nombre)?
                     const idLink = extraerIdModuloUrl(urlAct);
                     const dioPositivoEnTablaPorId = idLink && estadoPorIdEnTabla[idLink]?.realizada;
                     const dioPositivoEnTablaPorNombre = datosSemanas[sem].completas.some(m => mismaMateria(m, mat));
+                    const resultadoDirecto = resultadosDirectosPorActividad[act.id] || { realizada: false, nota: null };
 
-                    // 2. Entramos además al enlace directo para verificar el cuestionario/tarea
-                    let resultadoDirecto = { realizada: false, nota: null };
-                    try {
-                        const respAct = await sesion.get(urlAct);
-                        resultadoDirecto = analizarPaginaActividadMoodle(respAct.data);
-                    } catch (errLink) {
-                        console.error(`Error leyendo enlace ${urlAct}:`, errLink.message);
-                    }
-
-                    // DOBLE VERIFICACIÓN: Si dio realizada en el enlace directo O dio realizada en la Tabla de Calificaciones -> ¡COMPLETA!
+                    // Si dio realizada en el enlace directo O dio realizada en la tabla de calificaciones -> COMPLETA
                     const estaRealizada = resultadoDirecto.realizada || dioPositivoEnTablaPorId || dioPositivoEnTablaPorNombre;
                     const notaFinal = resultadoDirecto.nota || (idLink && estadoPorIdEnTabla[idLink]?.nota) || null;
 
-                    // Limpiamos registros previos de esa materia en esa semana y guardamos el veredicto definitivo
                     datosSemanas[sem].completas = datosSemanas[sem].completas.filter(m => !mismaMateria(m, mat));
                     datosSemanas[sem].faltan = datosSemanas[sem].faltan.filter(m => !mismaMateria(m, mat));
 
@@ -910,7 +928,7 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                 }
 
                 // ====================================================================
-                // PASO C: ARMAR EL RESUMEN SEMANAL Y GUARDAR EN NEON
+                // PASO 4: ARMAR RESUMEN FINAL Y GUARDAR EN NEON
                 // ====================================================================
                 let detallesTexto = [];
                 for (const sem of SEMANAS_ORDEN) {
