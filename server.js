@@ -501,7 +501,7 @@ app.put('/api/grupos/:id', async (req, res) => {
 });
 
 // ============================================================================
-// 4. BOT MOODLE (LECTURA EXACTA DE CUESTIONARIOS CON NOTA Y SIN "MAT" FANTASMA)
+// 4. BOT MOODLE (PRECISIÓN ESTRICTA EN CUESTIONARIOS/TAREAS Y NOTAS)
 // ============================================================================
 
 app.get('/api/bot/estado', (req, res) => {
@@ -548,47 +548,54 @@ function mismaMateria(matA, matB) {
     return canon(matA) === canon(matB);
 }
 
-// Analiza el HTML de una actividad de Moodle (como Mat_S02_Cuestionario 01) y devuelve { realizada: boolean, nota: string|null }
+// Analiza el HTML de una actividad de Moodle sin caer en "Calificación para aprobar: 6.00 de 10.00" ni en "Hecho: Ver"
 function analizarPaginaActividadMoodle(htmlCrudo) {
     const $ = cheerio.load(htmlCrudo);
-    const textoPlano = $('body').text().replace(/\s+/g, ' ').trim();
+    
+    // Quitamos el texto engañoso "Calificación para aprobar: X de Y" antes de analizar
+    const textoPlano = $('body').text()
+        .replace(/\s+/g, ' ')
+        .replace(/calificaci[oó]n para aprobar:\s*[0-9.,]+\s*de\s*[0-9.,]+/gi, '')
+        .trim();
     const textoLower = textoPlano.toLowerCase();
+
+    // 1. Si dice explícitamente que NO hizo intentos o NO entregó, es FALTA directo
+    if (
+        textoLower.includes('aún no se han realizado intentos') ||
+        textoLower.includes('no se han realizado intentos') ||
+        textoLower.includes('estado de la entrega no entregado') ||
+        textoLower.includes('sin entregar') ||
+        textoLower.includes('pendiente: recibir una calificaci') ||
+        textoLower.includes('por hacer: recibir una calificaci') ||
+        textoLower.includes('pendiente: hacer un envío') ||
+        textoLower.includes('por hacer: hacer un envío')
+    ) {
+        return { realizada: false, nota: null };
+    }
 
     let notaExtraida = null;
 
-    // 1. Buscar "Su calificación final en este cuestionario es 10.00/10.00" (Exacto a la captura)
+    // 2. Buscar "Su calificación final en este cuestionario es 10.00/10.00"
     const matchCalifFinal = textoPlano.match(/calificaci[oó]n final en este cuestionario es\s*([0-9]+[.,]?[0-9]*)/i);
     if (matchCalifFinal) {
         notaExtraida = matchCalifFinal[1];
     }
 
-    // 2. Buscar "Calificar 10.00 de 10.00" o "Calificación 8.50 de 10.00" dentro de la tarjeta de intento
+    // 3. Buscar "Calificar 10.00 de 10.00" (solo existe dentro de la tabla de un intento finalizado)
     if (!notaExtraida) {
-        const matchCalificarDe = textoPlano.match(/califica(?:r|ci[oó]n)\s*([0-9]+[.,]?[0-9]*)\s*de\s*[0-9]+/i);
+        const matchCalificarDe = textoPlano.match(/calificar\s+([0-9]+[.,]?[0-9]*)\s+de\s+[0-9]+/i);
         if (matchCalificarDe) {
             notaExtraida = matchCalificarDe[1];
         }
     }
 
-    // 3. Verificar señales inequívocas de que el alumno SÍ realizó el cuestionario o tarea
-    const tieneBadgeRecibirCalif = textoLower.includes('hecho: recibir una calificaci') || textoLower.includes('hecho: aprobar');
-    const tieneEstadoFinalizado = /estado\s*finalizado/i.test(textoPlano) || /estado\s*terminado/i.test(textoPlano);
-    const tieneIntentoCompletado = /intento\s*1/i.test(textoPlano) && (textoLower.includes('finalizado') || textoLower.includes('completado'));
+    // 4. Verificaciones estrictas de actividad realizada (Ignorando "Hecho: Ver")
+    const tieneBadgeRecibirCalif = textoLower.includes('hecho: recibir una calificaci') || textoLower.includes('hecho: aprobar') || textoLower.includes('hecho: hacer un envío');
+    const tieneEstadoFinalizado = /estado\s+finalizado/i.test(textoPlano) || /estado\s+terminado/i.test(textoPlano);
     const tieneTareaEntregada = textoLower.includes('enviado para calificar') || textoLower.includes('archivos enviados') || textoLower.includes('texto en línea');
 
-    // Señales de que NO lo hizo
-    const diceSinIntentos = textoLower.includes('aún no se han realizado intentos') || 
-                            textoLower.includes('no se han realizado intentos') || 
-                            textoLower.includes('pendiente: recibir una calificaci') ||
-                            textoLower.includes('por hacer: recibir una calificaci') ||
-                            textoLower.includes('no entregado');
-
-    if (notaExtraida !== null || tieneBadgeRecibirCalif || tieneEstadoFinalizado || tieneIntentoCompletado || tieneTareaEntregada) {
+    if (notaExtraida !== null || tieneBadgeRecibirCalif || tieneEstadoFinalizado || tieneTareaEntregada) {
         return { realizada: true, nota: notaExtraida };
-    }
-
-    if (diceSinIntentos) {
-        return { realizada: false, nota: null };
     }
 
     return { realizada: false, nota: null };
@@ -682,7 +689,6 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                             if (!textoFila || textoFila.includes('Cálculo total') || textoFila.includes('Total')) return;
 
                             const semEncontrada = SEMANAS_ORDEN.find(sem => textoFila.toUpperCase().includes(sem));
-                            // Si esa semana ya tiene enlaces directos cargados por vos, ignoramos la tabla general para evitar duplicados como "Mat"
                             if (semEncontrada && !semanasConEnlacesDirectos.has(semEncontrada)) {
                                 const materiaLimpia = extraerMateriaLimpia(textoFila);
                                 if (!materiaLimpia) return;
@@ -741,7 +747,6 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                 // PASO C: Limpieza final y armado del Resumen de Texto
                 let detallesTexto = [];
                 for (const sem of SEMANAS_ORDEN) {
-                    // Garantía absoluta: si una materia figura en completas, jamás puede figurar en faltan
                     datosSemanas[sem].faltan = datosSemanas[sem].faltan.filter(
                         f => !datosSemanas[sem].completas.some(c => mismaMateria(c, f))
                     );
@@ -752,11 +757,11 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                         const etiqueta = sem === "Evaluaciones" ? "Evaluaciones" : `Semana ${sem.replace('S0', '').replace('S', '')}`;
                         let estado = "";
                         if (cFalt === 0) {
-                            estado = `COMPLETA [${datosSemanas[sem].completas.join(', ')}]`;
+                            estado = `COMPLETA`;
                         } else if (cComp === 0) {
                             estado = "No realizó nada";
                         } else {
-                            estado = `Falta realizar ${datosSemanas[sem].faltan.join(', ').toLowerCase()} (Hecho: ${datosSemanas[sem].completas.join(', ')})`;
+                            estado = `Falta realizar ${datosSemanas[sem].faltan.join(', ').toLowerCase()}`;
                         }
                         detallesTexto.push(`${etiqueta}: ${estado}`);
                     }
