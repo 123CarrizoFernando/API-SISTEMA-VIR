@@ -526,14 +526,20 @@ app.post('/api/ejecutar_bot', async (req, res) => {
     ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, cursada_ids);
 });
 
+// Función normalizadora que unifica nombres con o sin tilde para que nunca queden duplicados
 function extraerMateriaLimpia(textoFila) {
-    const l = textoFila.toLowerCase();
-    if (l.includes('sociales') || l.includes('cs. soc')) return 'Cs. Sociales';
-    if (l.includes('naturales') || l.includes('cs. nat')) return 'Cs. Naturales';
+    const l = textoFila.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, ""); // Quita tildes
+    if (l.includes('sociales') || l.includes('cs. soc') || l.includes('soc')) return 'Cs. Sociales';
+    if (l.includes('naturales') || l.includes('cs. nat') || l.includes('nat')) return 'Cs. Naturales';
     if (l.includes('matem')) return 'Matemática';
     if (l.includes('lengua')) return 'Lengua';
-    if (l.includes('fpt') || l.includes('formaci')) return 'FpT';
+    if (l.includes('fpt') || l.includes('formaci') || l.includes('trabajo')) return 'FpT';
     return textoFila.split(/[_-]/)[0].replace(/CUESTIONARIO|TAREA/gi, '').trim().substring(0, 20);
+}
+
+function mismaMateria(matA, matB) {
+    const limpiar = (s) => String(s || '').toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z]/g, '');
+    return limpiar(matA) === limpiar(matB);
 }
 
 async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, cursadaIds) {
@@ -571,24 +577,47 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
 
             try {
                 const jar = new CookieJar();
-                const client = wrapper(axios.create({ jar, withCredentials: true, timeout: 15000 }));
+                const client = wrapper(axios.create({
+                    jar,
+                    withCredentials: true,
+                    timeout: 20000,
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                        'Accept-Language': 'es-AR,es;q=0.9'
+                    }
+                }));
 
+                // 1. Obtener token de login
                 const getLogin = await client.get(URL_LOGIN);
                 const $login = cheerio.load(getLogin.data);
                 const logintoken = $login('input[name="logintoken"]').val() || '';
 
+                // 2. Iniciar sesión
                 const formParams = new URLSearchParams();
                 formParams.append('username', String(al.dni).trim());
                 formParams.append('password', String(al.contrasena_moodle).trim());
                 if (logintoken) formParams.append('logintoken', logintoken);
 
-                await client.post(URL_LOGIN, formParams.toString(), {
+                const postLogin = await client.post(URL_LOGIN, formParams.toString(), {
                     headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
                 });
+
+                // Verificar si el login falló (para no pisar datos buenos con falsos "Falta realizar")
+                const htmlPostLogin = String(postLogin.data || '');
+                if (htmlPostLogin.includes('loginerrors') || htmlPostLogin.includes('Acceso inválido') || htmlPostLogin.includes('Invalid login')) {
+                    const msgError = `${al.nombre_completo.toUpperCase()}: ⚠️ Usuario o contraseña de Moodle incorrectos`;
+                    await pool.query(
+                        `UPDATE cursadas_modulos SET resumen_texto = $1, ultima_actualizacion_bot = CURRENT_TIMESTAMP WHERE id = $2`,
+                        [msgError, al.cursada_id]
+                    );
+                    continue;
+                }
 
                 let datosSemanas = {};
                 SEMANAS_ORDEN.forEach(s => datosSemanas[s] = { completas: [], faltan: [] });
 
+                // PASO A: Tabla General de Calificaciones (Solo para materias que NO tengan enlace directo configurado)
                 if (urlCalificaciones) {
                     const getGrades = await client.get(urlCalificaciones);
                     const $grades = cheerio.load(getGrades.data);
@@ -604,39 +633,84 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                             const hecha = simbolosOk.some(s => textoFila.includes(s)) && !textoFila.includes("Vacío") && !textoFila.includes(" - ");
 
                             if (hecha) {
-                                if (!datosSemanas[semEncontrada].completas.includes(materiaLimpia)) datosSemanas[semEncontrada].completas.push(materiaLimpia);
+                                if (!datosSemanas[semEncontrada].completas.some(m => mismaMateria(m, materiaLimpia))) {
+                                    datosSemanas[semEncontrada].completas.push(materiaLimpia);
+                                }
                             } else {
-                                if (!datosSemanas[semEncontrada].faltan.includes(materiaLimpia)) datosSemanas[semEncontrada].faltan.push(materiaLimpia);
+                                if (!datosSemanas[semEncontrada].faltan.some(m => mismaMateria(m, materiaLimpia)) &&
+                                    !datosSemanas[semEncontrada].completas.some(m => mismaMateria(m, materiaLimpia))) {
+                                    datosSemanas[semEncontrada].faltan.push(materiaLimpia);
+                                }
                             }
                         }
                     });
                 }
 
+                // PASO B: Enlaces Directos por Semana (Prioridad absoluta, pisa cualquier versión con o sin tilde)
                 for (const act of actividadesDirectas) {
                     const sem = act.semana;
                     const mat = act.materia;
                     const urlAct = act.url_actividad;
 
                     if (!datosSemanas[sem]) continue;
-                    datosSemanas[sem].completas = datosSemanas[sem].completas.filter(m => m !== mat);
-                    datosSemanas[sem].faltan = datosSemanas[sem].faltan.filter(m => m !== mat);
+                    // Eliminamos cualquier rastro previo de esta materia (con o sin tilde) en esa semana
+                    datosSemanas[sem].completas = datosSemanas[sem].completas.filter(m => !mismaMateria(m, mat));
+                    datosSemanas[sem].faltan = datosSemanas[sem].faltan.filter(m => !mismaMateria(m, mat));
 
                     if (urlAct === 'Revisión_Manual') {
                         datosSemanas[sem].completas.push(`${mat} (Colaborativa)`);
                         continue;
                     }
 
-                    const getAct = await client.get(urlAct);
-                    const textoPag = cheerio.load(getAct.data)('body').text();
-                    const palabrasCompletado = ["Finalizado", "Enviado para calificar", "Archivos enviados", "Texto en línea", "Calificación", "Hecho: Recibir una calificación", "Intentos: 1"];
+                    try {
+                        const getAct = await client.get(urlAct);
+                        const $act = cheerio.load(getAct.data);
+                        const textoPag = $act('body').text().replace(/\s+/g, ' ');
+                        const textoPagLower = textoPag.toLowerCase();
 
-                    if (palabrasCompletado.some(p => textoPag.includes(p))) {
-                        datosSemanas[sem].completas.push(mat);
-                    } else {
-                        datosSemanas[sem].faltan.push(mat);
+                        // Detectamos todas las variantes en las que Moodle informa que un cuestionario o tarea fue realizado
+                        const palabrasCompletado = [
+                            "finalizado",
+                            "terminado",
+                            "enviado para calificar",
+                            "archivos enviados",
+                            "texto en línea",
+                            "texto en linea",
+                            "calificación más alta",
+                            "calificacion mas alta",
+                            "calificación:",
+                            "hecho: recibir una calificación",
+                            "hecho: ver",
+                            "intentos permitidos",
+                            "resumen de sus intentos previos",
+                            "revisión",
+                            "revision",
+                            "puntos",
+                            "no se permiten más intentos"
+                        ];
+
+                        // Verificamos si tiene tabla de intentos realizados (`generaltable` o `quizattemptsummary`) o palabras clave
+                        const tieneTablaIntentos = $act('table.quizattemptsummary').length > 0 || textoPagLower.includes('resumen de sus intentos');
+                        const diceNoRealizado = textoPagLower.includes('aún no se han realizado intentos') || textoPagLower.includes('no se han realizado intentos') || textoPagLower.includes('no entregado') || textoPagLower.includes('sin entregar');
+
+                        let completada = false;
+                        if (tieneTablaIntentos && !diceNoRealizado) {
+                            completada = true;
+                        } else if (!diceNoRealizado && palabrasCompletado.some(p => textoPagLower.includes(p))) {
+                            completada = true;
+                        }
+
+                        if (completada) {
+                            datosSemanas[sem].completas.push(mat);
+                        } else {
+                            datosSemanas[sem].faltan.push(mat);
+                        }
+                    } catch (errLink) {
+                        console.error(`Error leyendo enlace ${urlAct}:`, errLink.message);
                     }
                 }
 
+                // PASO C: Armar texto de resumen y guardar en Neon
                 let detallesTexto = [];
                 for (const sem of SEMANAS_ORDEN) {
                     const cComp = datosSemanas[sem].completas.length;
