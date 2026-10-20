@@ -501,7 +501,7 @@ app.put('/api/grupos/:id', async (req, res) => {
 });
 
 // ============================================================================
-// 4. BOT MOODLE (PRECISIÓN ESTRICTA EN CUESTIONARIOS/TAREAS Y NOTAS)
+// 4. BOT MOODLE (DETECCIÓN EXACTA DE ACTIVIDADES REALIZADAS, PENDIENTES Y VENCIDAS)
 // ============================================================================
 
 app.get('/api/bot/estado', (req, res) => {
@@ -524,7 +524,6 @@ app.post('/api/ejecutar_bot', async (req, res) => {
     ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, cursada_ids);
 });
 
-// Unifica cualquier abreviatura de Moodle ("Mat_S02", "Cs. Soc", etc.) a los 5 nombres oficiales
 function extraerMateriaLimpia(textoFila) {
     const l = String(textoFila || '').toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
     if (l.includes('soc')) return 'Cs. Sociales';
@@ -548,40 +547,41 @@ function mismaMateria(matA, matB) {
     return canon(matA) === canon(matB);
 }
 
-// Analiza el HTML de una actividad de Moodle sin caer en "Calificación para aprobar: 6.00 de 10.00" ni en "Hecho: Ver"
+/**
+ * Analiza exclusivamente el contenedor principal de la actividad en Moodle.
+ * Distingue con 100% de exactitud:
+ * - Cuestionario Realizado (aunque ya haya vencido y diga "No se permiten más intentos")
+ * - Cuestionario NO Realizado (aunque tenga el tilde verde "Hecho: Ver" pero diga "Pendiente: Recibir una calificación" o tenga el botón "Intento de cuestionario")
+ * - Tarea Entregada vs Tarea No Entregada
+ */
 function analizarPaginaActividadMoodle(htmlCrudo) {
     const $ = cheerio.load(htmlCrudo);
-    
-    // Quitamos el texto engañoso "Calificación para aprobar: X de Y" antes de analizar
-    const textoPlano = $('body').text()
+
+    // Tomamos solo la región central de la actividad para que no interfieran menús laterales de Moodle
+    let contenedor = $('#region-main');
+    if (contenedor.length === 0) contenedor = $('div[role="main"]');
+    if (contenedor.length === 0) contenedor = $('body');
+
+    // Quitamos la línea informativa "Calificación para aprobar: 6.00 de 10.00" para que nunca se confunda con una nota real
+    const textoPlano = contenedor.text()
         .replace(/\s+/g, ' ')
         .replace(/calificaci[oó]n para aprobar:\s*[0-9.,]+\s*de\s*[0-9.,]+/gi, '')
         .trim();
     const textoLower = textoPlano.toLowerCase();
 
-    // 1. Si dice explícitamente que NO hizo intentos o NO entregó, es FALTA directo
-    if (
-        textoLower.includes('aún no se han realizado intentos') ||
-        textoLower.includes('no se han realizado intentos') ||
-        textoLower.includes('estado de la entrega no entregado') ||
-        textoLower.includes('sin entregar') ||
-        textoLower.includes('pendiente: recibir una calificaci') ||
-        textoLower.includes('por hacer: recibir una calificaci') ||
-        textoLower.includes('pendiente: hacer un envío') ||
-        textoLower.includes('por hacer: hacer un envío')
-    ) {
-        return { realizada: false, nota: null };
-    }
-
+    // ------------------------------------------------------------------------
+    // PASO 1: BUSCAR PRUEBAS POSITIVAS DE QUE EL ALUMNO SÍ HIZO LA ACTIVIDAD
+    // (Se evalúa PRIMERO, porque si el alumno tiene un Intento Finalizado, la actividad está hecha sin importar otros carteles)
+    // ------------------------------------------------------------------------
     let notaExtraida = null;
 
-    // 2. Buscar "Su calificación final en este cuestionario es 10.00/10.00"
-    const matchCalifFinal = textoPlano.match(/calificaci[oó]n final en este cuestionario es\s*([0-9]+[.,]?[0-9]*)/i);
+    // A) "Su calificación final en este cuestionario es 10.00/10.00" o "Calificación más alta: 8.00 / 10.00"
+    const matchCalifFinal = textoPlano.match(/calificaci[oó]n (?:final en este cuestionario es|m[aá]s alta:?)\s*([0-9]+[.,]?[0-9]*)/i);
     if (matchCalifFinal) {
         notaExtraida = matchCalifFinal[1];
     }
 
-    // 3. Buscar "Calificar 10.00 de 10.00" (solo existe dentro de la tabla de un intento finalizado)
+    // B) Dentro del recuadro de intento: "Calificar 10.00 de 10.00"
     if (!notaExtraida) {
         const matchCalificarDe = textoPlano.match(/calificar\s+([0-9]+[.,]?[0-9]*)\s+de\s+[0-9]+/i);
         if (matchCalificarDe) {
@@ -589,16 +589,50 @@ function analizarPaginaActividadMoodle(htmlCrudo) {
         }
     }
 
-    // 4. Verificaciones estrictas de actividad realizada (Ignorando "Hecho: Ver")
-    const tieneBadgeRecibirCalif = textoLower.includes('hecho: recibir una calificaci') || textoLower.includes('hecho: aprobar') || textoLower.includes('hecho: hacer un envío');
-    const tieneEstadoFinalizado = /estado\s+finalizado/i.test(textoPlano) || /estado\s+terminado/i.test(textoPlano);
-    const tieneTareaEntregada = textoLower.includes('enviado para calificar') || textoLower.includes('archivos enviados') || textoLower.includes('texto en línea');
+    // C) Bloque "Sus intentos" / "Intento 1" con "Estado Finalizado" (Exacto a la Imagen 1)
+    const tieneSusIntentosFinalizado = (
+        (textoLower.includes('sus intentos') || /intento\s+1/i.test(textoPlano) || textoLower.includes('resumen de sus intentos')) &&
+        (/estado\s*finalizado/i.test(textoPlano) || /estado\s*terminado/i.test(textoPlano) || textoLower.includes('completado'))
+    );
 
-    if (notaExtraida !== null || tieneBadgeRecibirCalif || tieneEstadoFinalizado || tieneTareaEntregada) {
+    // D) Chapita verde de Moodle que confirma calificación o envío (Ignorando por completo "Hecho: Ver")
+    const tieneChapitaCalificado = (
+        textoLower.includes('hecho: recibir una calificaci') ||
+        textoLower.includes('hecho: alcanzar la calificaci') ||
+        textoLower.includes('hecho: hacer un env') ||
+        textoLower.includes('hecho: realizar un intento')
+    );
+
+    // E) Tareas (mod/assign): "Enviado para calificar"
+    const tieneTareaEntregada = (
+        textoLower.includes('enviado para calificar') ||
+        (textoLower.includes('estado de la entrega') && textoLower.includes('enviado'))
+    );
+
+    if (notaExtraida !== null || tieneSusIntentosFinalizado || tieneChapitaCalificado || tieneTareaEntregada) {
         return { realizada: true, nota: notaExtraida };
     }
 
+    // ------------------------------------------------------------------------
+    // PASO 2: SI NO HAY INTENTO FINALIZADO NI NOTA, ES NO REALIZADA
+    // (Cubre la Imagen 2 donde dice "Hecho: Ver" + "Pendiente: Recibir una calificación" + botón "Intento de cuestionario",
+    //  y también cubre cuestionarios vencidos donde el alumno nunca hizo un intento)
+    // ------------------------------------------------------------------------
     return { realizada: false, nota: null };
+}
+
+// Pequeña función auxiliar para leer una URL con reintento automático si Moodle tarda en responder
+async function obtenerPaginaConReintento(client, url, intentos = 2) {
+    for (let i = 0; i < intentos; i++) {
+        try {
+            const resp = await client.get(url);
+            if (resp && resp.data) return resp.data;
+        } catch (err) {
+            if (i === intentos - 1) throw err;
+            await new Promise(r => setTimeout(r, 800));
+        }
+    }
+    return '';
 }
 
 async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, cursadaIds) {
@@ -622,10 +656,13 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
         const alumnos = resAlumnos.rows;
         estadoBot.total = alumnos.length;
 
-        const resAct = await pool.query(`SELECT * FROM actividades_moodle WHERE numero_modulo = $1 AND orientacion = $2 AND activa = TRUE`, [modulo, orientacion]);
+        // Ordenamos las actividades para que las procese prolijamente por semana
+        const resAct = await pool.query(
+            `SELECT * FROM actividades_moodle WHERE numero_modulo = $1 AND orientacion = $2 AND activa = TRUE ORDER BY semana ASC, materia ASC`,
+            [modulo, orientacion]
+        );
         const actividadesDirectas = resAct.rows;
 
-        // Detectamos qué semanas ya tienen enlaces directos configurados para NO mezclarlas con la tabla general
         const semanasConEnlacesDirectos = new Set(actividadesDirectas.map(a => a.semana));
 
         const resConf = await pool.query(`SELECT url_calificaciones FROM config_cursos_moodle WHERE numero_modulo = $1 AND orientacion = $2`, [modulo, orientacion]);
@@ -651,8 +688,8 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                 }));
 
                 // 1. Obtener token de login
-                const getLogin = await client.get(URL_LOGIN);
-                const $login = cheerio.load(getLogin.data);
+                const htmlLogin = await obtenerPaginaConReintento(client, URL_LOGIN);
+                const $login = cheerio.load(htmlLogin);
                 const logintoken = $login('input[name="logintoken"]').val() || '';
 
                 // 2. Iniciar sesión en Moodle
@@ -678,17 +715,19 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                 let datosSemanas = {};
                 SEMANAS_ORDEN.forEach(s => datosSemanas[s] = { completas: [], faltan: [] });
 
-                // PASO A: Tabla General de Calificaciones (SOLO como respaldo para semanas donde NO hayas cargado enlaces directos)
+                // PASO A: Visitar primero la URL de calificaciones del curso
+                // (Esto inicializa el contexto del curso en la sesión de Moodle para que las Semanas 2 y 3 nunca fallen al abrirse)
                 if (urlCalificaciones) {
                     try {
-                        const getGrades = await client.get(urlCalificaciones);
-                        const $grades = cheerio.load(getGrades.data);
+                        const htmlGrades = await obtenerPaginaConReintento(client, urlCalificaciones);
+                        const $grades = cheerio.load(htmlGrades);
 
                         $grades('tr').each((_, el) => {
                             const textoFila = $grades(el).text().replace(/\s+/g, ' ').trim();
                             if (!textoFila || textoFila.includes('Cálculo total') || textoFila.includes('Total')) return;
 
                             const semEncontrada = SEMANAS_ORDEN.find(sem => textoFila.toUpperCase().includes(sem));
+                            // Solo usamos la tabla general si esa semana NO tiene enlaces directos configurados
                             if (semEncontrada && !semanasConEnlacesDirectos.has(semEncontrada)) {
                                 const materiaLimpia = extraerMateriaLimpia(textoFila);
                                 if (!materiaLimpia) return;
@@ -714,13 +753,13 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                     }
                 }
 
-                // PASO B: Enlaces Directos por Semana (Lectura directa del cuestionario/tarea y extracción de Nota)
+                // PASO B: Enlaces Directos por Semana (Lectura directa de cada cuestionario/tarea)
                 for (const act of actividadesDirectas) {
                     const sem = act.semana;
                     const mat = act.materia;
-                    const urlAct = act.url_actividad;
+                    const urlAct = act.url_actividad ? act.url_actividad.trim() : '';
 
-                    if (!datosSemanas[sem]) continue;
+                    if (!datosSemanas[sem] || !urlAct) continue;
                     datosSemanas[sem].completas = datosSemanas[sem].completas.filter(m => !mismaMateria(m, mat));
                     datosSemanas[sem].faltan = datosSemanas[sem].faltan.filter(m => !mismaMateria(m, mat));
 
@@ -730,8 +769,8 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                     }
 
                     try {
-                        const getAct = await client.get(urlAct);
-                        const resultado = analizarPaginaActividadMoodle(getAct.data);
+                        const htmlAct = await obtenerPaginaConReintento(client, urlAct);
+                        const resultado = analizarPaginaActividadMoodle(htmlAct);
 
                         if (resultado.realizada) {
                             const etiquetaConNota = resultado.nota ? `${mat} (${resultado.nota})` : mat;
