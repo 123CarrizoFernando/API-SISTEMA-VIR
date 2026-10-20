@@ -338,7 +338,7 @@ app.delete('/api/cursada/:cursada_id', async (req, res) => {
 });
 
 // ============================================================================
-// 2. ENLACES MOODLE (COMPARTIDOS POR MÓDULO Y ORIENTACIÓN PARA TODA LA PROVINCIA)
+// 2. ENLACES MOODLE
 // ============================================================================
 
 app.get('/api/actividades', async (req, res) => {
@@ -416,7 +416,7 @@ app.post('/api/config_curso', async (req, res) => {
 });
 
 // ============================================================================
-// 3. GRUPOS Y PROYECTOS (AISLADOS POR SEDE)
+// 3. GRUPOS Y PROYECTOS
 // ============================================================================
 
 app.get('/api/grupos', async (req, res) => {
@@ -501,7 +501,7 @@ app.put('/api/grupos/:id', async (req, res) => {
 });
 
 // ============================================================================
-// 4. BOT MOODLE (CORREGIDO RECONOCIMIENTO DE 'MAT' Y PRIORIDAD DE ENLACES)
+// 4. BOT MOODLE (LECTURA EXACTA DE CUESTIONARIOS CON NOTA Y SIN "MAT" FANTASMA)
 // ============================================================================
 
 app.get('/api/bot/estado', (req, res) => {
@@ -524,18 +524,15 @@ app.post('/api/ejecutar_bot', async (req, res) => {
     ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, cursada_ids);
 });
 
-// Reconoce cualquier abreviatura de Moodle (ej: "MAT_S02", "CS. SOC", "NAT", "FPT") y la devuelve con el nombre oficial
-// Solo devuelve una de las 5 materias oficiales (o null si es una fila basura de Moodle)
+// Unifica cualquier abreviatura de Moodle ("Mat_S02", "Cs. Soc", etc.) a los 5 nombres oficiales
 function extraerMateriaLimpia(textoFila) {
     const l = String(textoFila || '').toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-
-    if (l.includes('social') || l.includes('cs. soc') || l.includes('cs soc') || /\bsoc[_\s-]/.test(l)) return 'Cs. Sociales';
-    if (l.includes('natural') || l.includes('cs. nat') || l.includes('cs nat') || /\bnat[_\s-]/.test(l)) return 'Cs. Naturales';
-    if (l.includes('matem') || /\bmat[_\s-]/.test(l) || /\bmate[_\s-]/.test(l)) return 'Matemática';
-    if (l.includes('lengua') || /\blen[_\s-]/.test(l) || /\bleng[_\s-]/.test(l)) return 'Lengua';
-    if (l.includes('fpt') || l.includes('formaci') || l.includes('trabajo')) return 'FpT';
-
-    return null; // Ignora filas raras que no sean una de las 5 materias reales
+    if (l.includes('soc')) return 'Cs. Sociales';
+    if (l.includes('nat')) return 'Cs. Naturales';
+    if (l.includes('mat')) return 'Matemática';
+    if (l.includes('len')) return 'Lengua';
+    if (l.includes('fpt') || l.includes('formaci') || l.includes('trab')) return 'FpT';
+    return null;
 }
 
 function mismaMateria(matA, matB) {
@@ -549,6 +546,52 @@ function mismaMateria(matA, matB) {
         return l.replace(/[^a-z]/g, '');
     };
     return canon(matA) === canon(matB);
+}
+
+// Analiza el HTML de una actividad de Moodle (como Mat_S02_Cuestionario 01) y devuelve { realizada: boolean, nota: string|null }
+function analizarPaginaActividadMoodle(htmlCrudo) {
+    const $ = cheerio.load(htmlCrudo);
+    const textoPlano = $('body').text().replace(/\s+/g, ' ').trim();
+    const textoLower = textoPlano.toLowerCase();
+
+    let notaExtraida = null;
+
+    // 1. Buscar "Su calificación final en este cuestionario es 10.00/10.00" (Exacto a la captura)
+    const matchCalifFinal = textoPlano.match(/calificaci[oó]n final en este cuestionario es\s*([0-9]+[.,]?[0-9]*)/i);
+    if (matchCalifFinal) {
+        notaExtraida = matchCalifFinal[1];
+    }
+
+    // 2. Buscar "Calificar 10.00 de 10.00" o "Calificación 8.50 de 10.00" dentro de la tarjeta de intento
+    if (!notaExtraida) {
+        const matchCalificarDe = textoPlano.match(/califica(?:r|ci[oó]n)\s*([0-9]+[.,]?[0-9]*)\s*de\s*[0-9]+/i);
+        if (matchCalificarDe) {
+            notaExtraida = matchCalificarDe[1];
+        }
+    }
+
+    // 3. Verificar señales inequívocas de que el alumno SÍ realizó el cuestionario o tarea
+    const tieneBadgeRecibirCalif = textoLower.includes('hecho: recibir una calificaci') || textoLower.includes('hecho: aprobar');
+    const tieneEstadoFinalizado = /estado\s*finalizado/i.test(textoPlano) || /estado\s*terminado/i.test(textoPlano);
+    const tieneIntentoCompletado = /intento\s*1/i.test(textoPlano) && (textoLower.includes('finalizado') || textoLower.includes('completado'));
+    const tieneTareaEntregada = textoLower.includes('enviado para calificar') || textoLower.includes('archivos enviados') || textoLower.includes('texto en línea');
+
+    // Señales de que NO lo hizo
+    const diceSinIntentos = textoLower.includes('aún no se han realizado intentos') || 
+                            textoLower.includes('no se han realizado intentos') || 
+                            textoLower.includes('pendiente: recibir una calificaci') ||
+                            textoLower.includes('por hacer: recibir una calificaci') ||
+                            textoLower.includes('no entregado');
+
+    if (notaExtraida !== null || tieneBadgeRecibirCalif || tieneEstadoFinalizado || tieneIntentoCompletado || tieneTareaEntregada) {
+        return { realizada: true, nota: notaExtraida };
+    }
+
+    if (diceSinIntentos) {
+        return { realizada: false, nota: null };
+    }
+
+    return { realizada: false, nota: null };
 }
 
 async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, cursadaIds) {
@@ -575,8 +618,11 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
         const resAct = await pool.query(`SELECT * FROM actividades_moodle WHERE numero_modulo = $1 AND orientacion = $2 AND activa = TRUE`, [modulo, orientacion]);
         const actividadesDirectas = resAct.rows;
 
+        // Detectamos qué semanas ya tienen enlaces directos configurados para NO mezclarlas con la tabla general
+        const semanasConEnlacesDirectos = new Set(actividadesDirectas.map(a => a.semana));
+
         const resConf = await pool.query(`SELECT url_calificaciones FROM config_cursos_moodle WHERE numero_modulo = $1 AND orientacion = $2`, [modulo, orientacion]);
-        const urlCalificaciones = resConf.rows[0]?.url_calificaciones || 'https://9002.edusalta.gov.ar/grade/report/user/index.php?id=71';
+        const urlCalificaciones = resConf.rows[0]?.url_calificaciones || '';
 
         for (let i = 0; i < alumnos.length; i++) {
             if (!estadoBot.ejecutando) break;
@@ -589,7 +635,7 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                 const client = wrapper(axios.create({
                     jar,
                     withCredentials: true,
-                    timeout: 20000,
+                    timeout: 25000,
                     headers: {
                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
                         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -625,47 +671,50 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                 let datosSemanas = {};
                 SEMANAS_ORDEN.forEach(s => datosSemanas[s] = { completas: [], faltan: [] });
 
-                // PASO A: Tabla General de Calificaciones
-                // PASO A: Tabla General de Calificaciones
+                // PASO A: Tabla General de Calificaciones (SOLO como respaldo para semanas donde NO hayas cargado enlaces directos)
                 if (urlCalificaciones) {
-                    const getGrades = await client.get(urlCalificaciones);
-                    const $grades = cheerio.load(getGrades.data);
+                    try {
+                        const getGrades = await client.get(urlCalificaciones);
+                        const $grades = cheerio.load(getGrades.data);
 
-                    $grades('tr').each((_, el) => {
-                        const textoFila = $grades(el).text().replace(/\s+/g, ' ').trim();
-                        if (!textoFila || textoFila.includes('Cálculo total') || textoFila.includes('Total')) return;
+                        $grades('tr').each((_, el) => {
+                            const textoFila = $grades(el).text().replace(/\s+/g, ' ').trim();
+                            if (!textoFila || textoFila.includes('Cálculo total') || textoFila.includes('Total')) return;
 
-                        const semEncontrada = SEMANAS_ORDEN.find(sem => textoFila.toUpperCase().includes(sem));
-                        if (semEncontrada) {
-                            const materiaLimpia = extraerMateriaLimpia(textoFila);
-                            if (!materiaLimpia) return; // Si no es una de las 5 materias, la descarta
+                            const semEncontrada = SEMANAS_ORDEN.find(sem => textoFila.toUpperCase().includes(sem));
+                            // Si esa semana ya tiene enlaces directos cargados por vos, ignoramos la tabla general para evitar duplicados como "Mat"
+                            if (semEncontrada && !semanasConEnlacesDirectos.has(semEncontrada)) {
+                                const materiaLimpia = extraerMateriaLimpia(textoFila);
+                                if (!materiaLimpia) return;
 
-                            const simbolosOk = ["%", "✓", "✔", "✗", "✘"];
-                            const hecha = simbolosOk.some(s => textoFila.includes(s)) && !textoFila.includes("Vacío") && !textoFila.includes(" - ");
+                                const simbolosOk = ["%", "✓", "✔", "✗", "✘"];
+                                const hecha = simbolosOk.some(s => textoFila.includes(s)) && !textoFila.includes("Vacío") && !textoFila.includes(" - ");
 
-                            if (hecha) {
-                                if (!datosSemanas[semEncontrada].completas.some(m => mismaMateria(m, materiaLimpia))) {
-                                    datosSemanas[semEncontrada].completas.push(materiaLimpia);
-                                }
-                                datosSemanas[semEncontrada].faltan = datosSemanas[semEncontrada].faltan.filter(m => !mismaMateria(m, materiaLimpia));
-                            } else {
-                                if (!datosSemanas[semEncontrada].faltan.some(m => mismaMateria(m, materiaLimpia)) &&
-                                    !datosSemanas[semEncontrada].completas.some(m => mismaMateria(m, materiaLimpia))) {
-                                    datosSemanas[semEncontrada].faltan.push(materiaLimpia);
+                                if (hecha) {
+                                    if (!datosSemanas[semEncontrada].completas.some(m => mismaMateria(m, materiaLimpia))) {
+                                        datosSemanas[semEncontrada].completas.push(materiaLimpia);
+                                    }
+                                    datosSemanas[semEncontrada].faltan = datosSemanas[semEncontrada].faltan.filter(m => !mismaMateria(m, materiaLimpia));
+                                } else {
+                                    if (!datosSemanas[semEncontrada].faltan.some(m => mismaMateria(m, materiaLimpia)) &&
+                                        !datosSemanas[semEncontrada].completas.some(m => mismaMateria(m, materiaLimpia))) {
+                                        datosSemanas[semEncontrada].faltan.push(materiaLimpia);
+                                    }
                                 }
                             }
-                        }
-                    });
+                        });
+                    } catch (eGrades) {
+                        console.error('Error leyendo tabla general:', eGrades.message);
+                    }
                 }
 
-                // PASO B: Enlaces Directos por Semana (Pisa cualquier abreviatura de la tabla general como "mat")
+                // PASO B: Enlaces Directos por Semana (Lectura directa del cuestionario/tarea y extracción de Nota)
                 for (const act of actividadesDirectas) {
                     const sem = act.semana;
                     const mat = act.materia;
                     const urlAct = act.url_actividad;
 
                     if (!datosSemanas[sem]) continue;
-                    // Borramos de completas y faltan cualquier rastro previo de esta materia (incluso si decía "mat")
                     datosSemanas[sem].completas = datosSemanas[sem].completas.filter(m => !mismaMateria(m, mat));
                     datosSemanas[sem].faltan = datosSemanas[sem].faltan.filter(m => !mismaMateria(m, mat));
 
@@ -676,42 +725,11 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
 
                     try {
                         const getAct = await client.get(urlAct);
-                        const $act = cheerio.load(getAct.data);
-                        const textoPag = $act('body').text().replace(/\s+/g, ' ');
-                        const textoPagLower = textoPag.toLowerCase();
+                        const resultado = analizarPaginaActividadMoodle(getAct.data);
 
-                        const palabrasCompletado = [
-                            "finalizado",
-                            "terminado",
-                            "enviado para calificar",
-                            "archivos enviados",
-                            "texto en línea",
-                            "texto en linea",
-                            "calificación más alta",
-                            "calificacion mas alta",
-                            "calificación:",
-                            "hecho: recibir una calificación",
-                            "hecho: ver",
-                            "hecho:",
-                            "resumen de sus intentos previos",
-                            "revisión",
-                            "revision",
-                            "puntos",
-                            "no se permiten más intentos"
-                        ];
-
-                        const tieneTablaIntentos = $act('table.quizattemptsummary').length > 0 \vert{}\vert{}$act('table.generaltable').length > 0 || textoPagLower.includes('resumen de sus intentos');
-                        const diceNoRealizado = textoPagLower.includes('aún no se han realizado intentos') || textoPagLower.includes('no se han realizado intentos') || textoPagLower.includes('no entregado') || textoPagLower.includes('sin entregar');
-
-                        let completada = false;
-                        if (tieneTablaIntentos && !diceNoRealizado) {
-                            completada = true;
-                        } else if (!diceNoRealizado && palabrasCompletado.some(p => textoPagLower.includes(p))) {
-                            completada = true;
-                        }
-
-                        if (completada) {
-                            datosSemanas[sem].completas.push(mat);
+                        if (resultado.realizada) {
+                            const etiquetaConNota = resultado.nota ? `${mat} (${resultado.nota})` : mat;
+                            datosSemanas[sem].completas.push(etiquetaConNota);
                         } else {
                             datosSemanas[sem].faltan.push(mat);
                         }
@@ -720,10 +738,10 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                     }
                 }
 
-               // PASO C: Limpieza cruzada de seguridad y armado de texto
+                // PASO C: Limpieza final y armado del Resumen de Texto
                 let detallesTexto = [];
                 for (const sem of SEMANAS_ORDEN) {
-                    // Regla de oro: Si una materia está en 'completas' (o tiene enlaces directos de todas las materias), jamás puede quedar en 'faltan'
+                    // Garantía absoluta: si una materia figura en completas, jamás puede figurar en faltan
                     datosSemanas[sem].faltan = datosSemanas[sem].faltan.filter(
                         f => !datosSemanas[sem].completas.some(c => mismaMateria(c, f))
                     );
@@ -733,9 +751,13 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                     if (cComp > 0 || cFalt > 0) {
                         const etiqueta = sem === "Evaluaciones" ? "Evaluaciones" : `Semana ${sem.replace('S0', '').replace('S', '')}`;
                         let estado = "";
-                        if (cFalt === 0) estado = "COMPLETA";
-                        else if (cComp === 0) estado = "No realizó nada";
-                        else estado = `Falta realizar ${datosSemanas[sem].faltan.join(', ').toLowerCase()}`;
+                        if (cFalt === 0) {
+                            estado = `COMPLETA [${datosSemanas[sem].completas.join(', ')}]`;
+                        } else if (cComp === 0) {
+                            estado = "No realizó nada";
+                        } else {
+                            estado = `Falta realizar ${datosSemanas[sem].faltan.join(', ').toLowerCase()} (Hecho: ${datosSemanas[sem].completas.join(', ')})`;
+                        }
                         detallesTexto.push(`${etiqueta}: ${estado}`);
                     }
                 }
@@ -745,8 +767,8 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                     : `${al.nombre_completo.toUpperCase()}: Sin registros`;
 
                 await pool.query(
-                    `UPDATE cursadas_modulos SET seguimiento_semanal = $1, resumen_texto = $2, ultima_actualizacion_bot = CURRENT_TIMESTAMP WHERE id = $3`,
-                    [datosSemanas, resumenFinal, al.cursada_id]
+                    `UPDATE cursadas_modulos SET seguimiento_semanal = $1::jsonb, resumen_texto = $2, ultima_actualizacion_bot = CURRENT_TIMESTAMP WHERE id = $3`,
+                    [JSON.stringify(datosSemanas), resumenFinal, al.cursada_id]
                 );
             } catch (errAl) {
                 console.error(`Error con ${al.nombre_completo}:`, errAl.message);
@@ -754,6 +776,7 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
         }
         estadoBot = { ejecutando: false, progreso: `¡Seguimiento de ${sede} completado!`, procesados: alumnos.length, total: alumnos.length };
     } catch (errGral) {
+        console.error(errGral);
         estadoBot = { ejecutando: false, progreso: 'Error al ejecutar el bot', procesados: 0, total: 0 };
     }
 }
@@ -762,8 +785,8 @@ app.put('/api/seguimiento', async (req, res) => {
     try {
         const { cursada_id, seguimiento_json, resumen_texto } = req.body;
         await pool.query(
-            `UPDATE cursadas_modulos SET seguimiento_semanal = $1, resumen_texto = $2, ultima_actualizacion_bot = CURRENT_TIMESTAMP WHERE id = $3`,
-            [seguimiento_json, resumen_texto, cursada_id]
+            `UPDATE cursadas_modulos SET seguimiento_semanal = $1::jsonb, resumen_texto = $2, ultima_actualizacion_bot = CURRENT_TIMESTAMP WHERE id = $3`,
+            [JSON.stringify(seguimiento_json), resumen_texto, cursada_id]
         );
         res.json({ mensaje: 'Seguimiento actualizado' });
     } catch (err) {
