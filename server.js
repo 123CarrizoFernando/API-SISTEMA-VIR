@@ -394,25 +394,41 @@ app.delete('/api/actividades/:id', async (req, res) => {
 app.get('/api/config_curso', async (req, res) => {
     try {
         const { modulo, orientacion } = req.query;
-        const result = await pool.query('SELECT * FROM config_cursos_moodle WHERE numero_modulo = $1 AND orientacion = $2', [modulo, orientacion]);
-        res.json(result.rows[0] || { evaluaciones_cerradas: false });
+        const result = await pool.query(
+            'SELECT * FROM config_cursos_moodle WHERE numero_modulo = $1 AND TRIM(LOWER(orientacion)) = TRIM(LOWER($2))',
+            [modulo, orientacion]
+        );
+        res.json(result.rows[0] || { url_calificaciones: '', evaluaciones_cerradas: false });
     } catch (err) {
-        res.status(500).json({ error: 'Error config_curso' });
+        console.error('Error GET config_curso:', err.message);
+        res.status(500).json({ error: err.message });
     }
 });
 
 app.post('/api/config_curso', async (req, res) => {
     try {
         const { numero_modulo, orientacion, url_calificaciones } = req.body;
-        const existe = await pool.query('SELECT id FROM config_cursos_moodle WHERE numero_modulo = $1 AND orientacion = $2', [numero_modulo, orientacion]);
+        const existe = await pool.query(
+            'SELECT id FROM config_cursos_moodle WHERE numero_modulo = $1 AND TRIM(LOWER(orientacion)) = TRIM(LOWER($2))',
+            [numero_modulo, orientacion]
+        );
+
+        let result;
         if (existe.rows.length > 0) {
-            await pool.query('UPDATE config_cursos_moodle SET url_calificaciones = $1 WHERE id = $2', [url_calificaciones, existe.rows[0].id]);
+            result = await pool.query(
+                'UPDATE config_cursos_moodle SET url_calificaciones = $1 WHERE id = $2 RETURNING *',
+                [url_calificaciones ? url_calificaciones.trim() : '', existe.rows[0].id]
+            );
         } else {
-            await pool.query('INSERT INTO config_cursos_moodle (numero_modulo, orientacion, url_calificaciones, evaluaciones_cerradas) VALUES ($1, $2, $3, FALSE)', [numero_modulo, orientacion, url_calificaciones]);
+            result = await pool.query(
+                'INSERT INTO config_cursos_moodle (numero_modulo, orientacion, url_calificaciones) VALUES ($1, $2, $3) RETURNING *',
+                [numero_modulo, orientacion.trim(), url_calificaciones ? url_calificaciones.trim() : '']
+            );
         }
-        res.json({ mensaje: 'URL guardada' });
+        res.json({ mensaje: 'URL guardada correctamente', data: result.rows[0] });
     } catch (err) {
-        res.status(500).json({ error: 'Error al guardar URL' });
+        console.error('Error POST config_curso:', err.message);
+        res.status(500).json({ error: 'Error en base de datos: ' + err.message });
     }
 });
 
