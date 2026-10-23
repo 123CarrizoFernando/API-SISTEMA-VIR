@@ -14,7 +14,6 @@ const pool = new Pool({
     ssl: { rejectUnauthorized: false }
 });
 
-// Incluye Evaluaciones y S15_Recup (Recuperatorios Semana 15)
 const SEMANAS_ORDEN = ["S02", "S03", "S04", "S07", "S08", "S11", "S12", "Evaluaciones", "S15_Recup"];
 const SEMANAS_CURSADA = ["S02", "S03", "S04", "S07", "S08", "S11", "S12"];
 const SEMANAS_EXAMENES = ["Evaluaciones", "S15_Recup"];
@@ -121,7 +120,7 @@ app.delete('/api/usuarios/:id', async (req, res) => {
 });
 
 // ============================================================================
-// 1. GESTIÓN DE ALUMNOS (FILTRADO POR SEDE, MÓDULO, ORIENTACIÓN, AÑO Y PERÍODO)
+// 1. GESTIÓN DE ALUMNOS
 // ============================================================================
 
 app.get('/api/alumnos_cursada', async (req, res) => {
@@ -340,7 +339,7 @@ app.delete('/api/cursada/:cursada_id', async (req, res) => {
 });
 
 // ============================================================================
-// 2. ENLACES MOODLE
+// 2. ENLACES MOODLE Y ESTADO DE CIERRE DE EVALUACIONES
 // ============================================================================
 
 app.get('/api/actividades', async (req, res) => {
@@ -396,7 +395,7 @@ app.get('/api/config_curso', async (req, res) => {
     try {
         const { modulo, orientacion } = req.query;
         const result = await pool.query('SELECT * FROM config_cursos_moodle WHERE numero_modulo = $1 AND orientacion = $2', [modulo, orientacion]);
-        res.json(result.rows[0] || {});
+        res.json(result.rows[0] || { evaluaciones_cerradas: false });
     } catch (err) {
         res.status(500).json({ error: 'Error config_curso' });
     }
@@ -409,11 +408,60 @@ app.post('/api/config_curso', async (req, res) => {
         if (existe.rows.length > 0) {
             await pool.query('UPDATE config_cursos_moodle SET url_calificaciones = $1 WHERE id = $2', [url_calificaciones, existe.rows[0].id]);
         } else {
-            await pool.query('INSERT INTO config_cursos_moodle (numero_modulo, orientacion, url_calificaciones) VALUES ($1, $2, $3)', [numero_modulo, orientacion, url_calificaciones]);
+            await pool.query('INSERT INTO config_cursos_moodle (numero_modulo, orientacion, url_calificaciones, evaluaciones_cerradas) VALUES ($1, $2, $3, FALSE)', [numero_modulo, orientacion, url_calificaciones]);
         }
         res.json({ mensaje: 'URL guardada' });
     } catch (err) {
         res.status(500).json({ error: 'Error al guardar URL' });
+    }
+});
+
+// NUEVO ENDPOINT: BOTÓN "CERRAR EVALUACIONES" / "REABRIR EVALUACIONES"
+// Si se cierran, todas las evaluaciones no realizadas pasan automáticamente a "A Recuperar en S15"
+app.post('/api/config_curso/cerrar_evaluaciones', async (req, res) => {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const { numero_modulo, orientacion, sede = 'Tartagal', anio = 2026, periodo = '2° Período', cerradas } = req.body;
+
+        const existe = await client.query('SELECT id FROM config_cursos_moodle WHERE numero_modulo = $1 AND orientacion = $2', [numero_modulo, orientacion]);
+        if (existe.rows.length > 0) {
+            await client.query('UPDATE config_cursos_moodle SET evaluaciones_cerradas = $1 WHERE id = $2', [cerradas, existe.rows[0].id]);
+        } else {
+            await client.query('INSERT INTO config_cursos_moodle (numero_modulo, orientacion, url_calificaciones, evaluaciones_cerradas) VALUES ($1, $2, $3, $4)', [numero_modulo, orientacion, '', cerradas]);
+        }
+
+        // Actualizamos inmediatamente el resumen_texto de todos los alumnos de esa sede/módulo según si ahora están cerradas o abiertas
+        const resAl = await client.query(
+            `SELECT c.id as cursada_id, a.nombre_completo, c.seguimiento_semanal
+             FROM cursadas_modulos c JOIN alumnos a ON a.id = c.alumno_id
+             WHERE c.numero_modulo = $1 AND c.orientacion = $2 AND c.anio = $3 AND c.periodo = $4 AND COALESCE(c.sede, 'Tartagal') = $5`,
+            [numero_modulo, orientacion, anio, periodo, sede]
+        );
+
+        for (const row of resAl.rows) {
+            if (!row.seguimiento_semanal) continue;
+            const datosSemanas = typeof row.seguimiento_semanal === 'string'
+                ? JSON.parse(row.seguimiento_semanal)
+                : row.seguimiento_semanal;
+
+            const nuevoResumen = construirResumenTextoAlumno(row.nombre_completo, datosSemanas, cerradas);
+            await client.query(`UPDATE cursadas_modulos SET resumen_texto = $1 WHERE id = $2`, [nuevoResumen, row.cursada_id]);
+        }
+
+        await client.query('COMMIT');
+        res.json({
+            mensaje: cerradas
+                ? '⛔ Evaluaciones CERRADAS: Quienes no rindieron pasaron automáticamente a Recuperatorio (Semana 15).'
+                : '🔓 Evaluaciones ABIERTAS: Quienes aún no rindieron figuran en tiempo para realizarlas.',
+            evaluaciones_cerradas: cerradas
+        });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err);
+        res.status(500).json({ error: 'Error al cambiar estado de evaluaciones' });
+    } finally {
+        client.release();
     }
 });
 
@@ -503,7 +551,7 @@ app.put('/api/grupos/:id', async (req, res) => {
 });
 
 // ============================================================================
-// 4. BOT MOODLE (CON MODO "SOLO EVALUACIONES", NOTA >= 6 Y SEMANA 15 RECUPERATORIOS)
+// 4. BOT MOODLE (DETECCIÓN DE EVALUACIONES ABIERTAS VS CERRADAS + SEMANA 15)
 // ============================================================================
 
 app.get('/api/bot/estado', (req, res) => {
@@ -577,15 +625,14 @@ function extraerIdModuloUrl(url) {
     return match ? match[1] : null;
 }
 
-// Convierte una nota en texto (ej: "8,50", "80.00%", "10.00") a número en escala 0 a 10
 function parsearNotaEscala10(notaRaw) {
     if (notaRaw === null || notaRaw === undefined) return null;
     const str = String(notaRaw).trim();
+    if (str === '-' || str === '') return null;
     const match = str.match(/([0-9]+[.,]?[0-9]*)/);
     if (!match) return null;
     let val = parseFloat(match[1].replace(',', '.'));
     if (isNaN(val)) return null;
-    // Si viene como porcentaje (ej. 80% o 66.67%), lo pasamos a escala de 10 (8.0 o 6.67)
     if (str.includes('%') || val > 10) {
         val = val / 10.0;
     }
@@ -597,6 +644,10 @@ function formatearNota(num) {
     return Number.isInteger(num) ? `${num}` : num.toFixed(2).replace(/\.00$/, '');
 }
 
+/**
+ * Evalúa una fila de la Tabla General de Calificaciones.
+ * Si en la columna de nota aparece "-", se considera NO REALIZADA (realizada: false, nota: null).
+ */
 function evaluarFilaTablaCalificaciones($grades, filaEl) {
     const textoFila = $grades(filaEl).text().replace(/\s+/g, ' ').trim();
     if (!textoFila || textoFila.includes('Cálculo total') || textoFila.includes('Total del curso')) {
@@ -605,12 +656,16 @@ function evaluarFilaTablaCalificaciones($grades, filaEl) {
 
     const celdaGrade = $grades(filaEl).find('td.column-grade').text().replace(/\s+/g, ' ').trim();
     const celdaPorc = $grades(filaEl).find('td.column-percentage').text().replace(/\s+/g, ' ').trim();
-    const simbolosOk = ["%", "✓", "✔", "✗", "✘"];
+
+    // Si en Calificaciones sale "-" o "Vacío", NO está realizada
+    if (celdaGrade === '-' || celdaGrade.toLowerCase().includes('vacío') || celdaGrade.toLowerCase().includes('vacio')) {
+        return { realizada: false, nota: null, notaNum: null };
+    }
 
     let realizada = false;
     let notaNum = null;
 
-    if (celdaGrade && celdaGrade !== '-' && !celdaGrade.toLowerCase().includes('vacío') && !celdaGrade.toLowerCase().includes('vacio')) {
+    if (celdaGrade && celdaGrade !== '-') {
         notaNum = parsearNotaEscala10(celdaGrade);
         if (notaNum !== null) realizada = true;
     }
@@ -620,19 +675,14 @@ function evaluarFilaTablaCalificaciones($grades, filaEl) {
         if (notaNum !== null) realizada = true;
     }
 
-    if (!realizada) {
-        const tieneSimbolo = simbolosOk.some(s => textoFila.includes(s));
-        const diceVacio = textoFila.includes('Vacío') || textoFila.includes('Vacio');
-        if (tieneSimbolo && !diceVacio) {
-            realizada = true;
-            const matchPorc = textoFila.match(/([0-9]+[.,]?[0-9]*)\s*%/);
-            if (matchPorc) notaNum = parsearNotaEscala10(matchPorc[1] + '%');
-        }
-    }
-
     return { realizada, nota: formatearNota(notaNum), notaNum };
 }
 
+/**
+ * Analiza la página del enlace directo de la actividad o evaluación.
+ * Si tiene el botón "Intento de cuestionario" / "Intentar cuestionario" y NO tiene un intento finalizado ni nota,
+ * devuelve { realizada: false, disponibleParaRendir: true }.
+ */
 function analizarPaginaActividadMoodle(htmlCrudo) {
     const $ = cheerio.load(htmlCrudo);
 
@@ -648,13 +698,13 @@ function analizarPaginaActividadMoodle(htmlCrudo) {
 
     let notaNum = null;
 
-    // 1. "Su calificación final en este cuestionario es 10.00/10.00" o "Calificación más alta: 8.00 / 10.00"
+    // 1. Buscar "Su calificación final en este cuestionario es 10.00/10.00" o "Calificación más alta: 8.00 / 10.00"
     const matchCalifFinal = textoPlano.match(/calificaci[oó]n (?:final en este cuestionario es|m[aá]s alta:?)\s*([0-9]+[.,]?[0-9]*)/i);
     if (matchCalifFinal) {
         notaNum = parsearNotaEscala10(matchCalifFinal[1]);
     }
 
-    // 2. "Calificar 10.00 de 10.00" dentro del cuadro de intento
+    // 2. Buscar "Calificar 10.00 de 10.00" dentro de la tabla de un intento finalizado
     if (notaNum === null) {
         const matchCalificarDe = textoPlano.match(/calificar\s+([0-9]+[.,]?[0-9]*)\s+de\s+[0-9]+/i);
         if (matchCalificarDe) {
@@ -680,10 +730,20 @@ function analizarPaginaActividadMoodle(htmlCrudo) {
     );
 
     if (notaNum !== null || tieneSusIntentosFinalizado || tieneChapitaCalificado || tieneTareaEntregada) {
-        return { realizada: true, nota: formatearNota(notaNum), notaNum };
+        return { realizada: true, nota: formatearNota(notaNum), notaNum, cerradaEnMoodle: false };
     }
 
-    return { realizada: false, nota: null, notaNum: null };
+    // Si NO la hizo, verificamos si aparece el botón "Intento de cuestionario" / "Intentar resolver el cuestionario ahora" (aún abierta)
+    // o si dice "Este cuestionario se cerró" / "No se permiten más intentos" (ya vencida en Moodle)
+    const tieneBotonIntentar = textoLower.includes('intento de cuestionario') || textoLower.includes('intentar resolver') || textoLower.includes('agregar entrega');
+    const diceCerrado = textoLower.includes('este cuestionario se cerró') || textoLower.includes('este cuestionario está cerrado') || textoLower.includes('no se permiten más intentos');
+
+    return {
+        realizada: false,
+        nota: null,
+        notaNum: null,
+        cerradaEnMoodle: diceCerrado && !tieneBotonIntentar
+    };
 }
 
 function crearSesionMoodle() {
@@ -782,11 +842,16 @@ function crearSesionMoodle() {
     return { get, postLogin };
 }
 
-// Genera el texto de resumen unificando el seguimiento normal + las Evaluaciones con nota (6 o más = Aprobado, <6 = Desaprobado -> S15)
-function construirResumenTextoAlumno(nombreAlumno, datosSemanas) {
+/**
+ * Construye el texto de resumen teniendo en cuenta si las Evaluaciones siguen abiertas (en tiempo) o si ya se cerraron.
+ * - Si NO rindió y están ABIERTAS -> "Pendiente (En tiempo)"
+ * - Si NO rindió y están CERRADAS -> "Sin rendir (A Recup. S15)"
+ * - Si rindió y sacó < 6 -> "Desaprobado (A Recup. S15)"
+ * - Si rindió y sacó >= 6 -> "Aprobado"
+ */
+function construirResumenTextoAlumno(nombreAlumno, datosSemanas, evaluacionesCerradasManual = false) {
     let detallesTexto = [];
 
-    // 1. Semanas regulares de cursada (S02 a S12): solo importa si están hechas o faltan
     for (const sem of SEMANAS_CURSADA) {
         if (!datosSemanas[sem]) continue;
         datosSemanas[sem].faltan = (datosSemanas[sem].faltan || []).filter(
@@ -805,7 +870,6 @@ function construirResumenTextoAlumno(nombreAlumno, datosSemanas) {
         }
     }
 
-    // 2. Evaluaciones (con Nota y estado Aprobado / Desaprobado -> Recuperatorio S15)
     if (datosSemanas["Evaluaciones"]) {
         const ev = datosSemanas["Evaluaciones"];
         const detalleEval = ev.detalle_notas || {};
@@ -821,24 +885,22 @@ function construirResumenTextoAlumno(nombreAlumno, datosSemanas) {
                 } else if (info.realizada) {
                     partesEval.push(`Evaluación ${mat} (Realizada)`);
                 } else {
-                    partesEval.push(`Evaluación ${mat}: Sin rendir (A Recup. S15)`);
+                    // NO LA HIZO TODAVÍA: Miramos si las evaluaciones ya se cerraron o si sigue en tiempo
+                    const yaCerro = evaluacionesCerradasManual || Boolean(info.cerradaEnMoodle);
+                    if (yaCerro) {
+                        partesEval.push(`Evaluación ${mat}: Sin rendir (A Recup. S15)`);
+                    } else {
+                        partesEval.push(`Evaluación ${mat}: Pendiente (En tiempo)`);
+                    }
                 }
             }
         }
 
         if (partesEval.length > 0) {
             detallesTexto.push(`EVALUACIONES: ${partesEval.join(' | ')}`);
-        } else {
-            const cComp = (ev.completas || []).length;
-            const cFalt = (ev.faltan || []).length;
-            if (cComp > 0 || cFalt > 0) {
-                const todas = [...(ev.completas || []), ...(ev.faltan || [])];
-                detallesTexto.push(`EVALUACIONES: ${todas.join(', ')}`);
-            }
         }
     }
 
-    // 3. Recuperatorios Semana 15 (S15_Recup)
     if (datosSemanas["S15_Recup"]) {
         const rec = datosSemanas["S15_Recup"];
         const detalleRec = rec.detalle_notas || {};
@@ -889,14 +951,14 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
             `SELECT * FROM actividades_moodle WHERE numero_modulo = $1 AND orientacion = $2 AND activa = TRUE ORDER BY semana ASC, materia ASC`,
             [modulo, orientacion]
         );
-        // Si pidió "Solo Evaluaciones", filtramos únicamente los enlaces de Evaluaciones y S15_Recup
         const todasActividades = resAct.rows;
         const actividadesAEscanear = soloEvaluaciones
             ? todasActividades.filter(a => SEMANAS_EXAMENES.includes(a.semana))
             : todasActividades;
 
-        const resConf = await pool.query(`SELECT url_calificaciones FROM config_cursos_moodle WHERE numero_modulo = $1 AND orientacion = $2`, [modulo, orientacion]);
+        const resConf = await pool.query(`SELECT url_calificaciones, COALESCE(evaluaciones_cerradas, FALSE) as evaluaciones_cerradas FROM config_cursos_moodle WHERE numero_modulo = $1 AND orientacion = $2`, [modulo, orientacion]);
         let urlCalificacionesConfigurada = resConf.rows[0]?.url_calificaciones || '';
+        const evaluacionesCerradasManual = Boolean(resConf.rows[0]?.evaluaciones_cerradas);
 
         for (let i = 0; i < alumnos.length; i++) {
             if (!estadoBot.ejecutando) break;
@@ -917,7 +979,6 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                     continue;
                 }
 
-                // Si es "Solo Evaluaciones", partimos del JSON que ya tenía el alumno para NO borrarle las semanas S02 a S12
                 let datosSemanas = {};
                 if (soloEvaluaciones && al.seguimiento_semanal) {
                     datosSemanas = typeof al.seguimiento_semanal === 'string'
@@ -935,7 +996,7 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                 let courseIdDetectado = null;
                 const resultadosDirectosPorActividad = {};
 
-                // PASO 1: Visitar los enlaces directos que correspondan (todos o solo Evaluaciones/S15)
+                // PASO 1: Visitar cada enlace directo
                 for (const act of actividadesAEscanear) {
                     const urlAct = act.url_actividad ? act.url_actividad.trim() : '';
                     if (!urlAct || urlAct === 'Revisión_Manual') continue;
@@ -951,11 +1012,11 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
 
                         resultadosDirectosPorActividad[act.id] = analizarPaginaActividadMoodle(htmlAct);
                     } catch (errLink) {
-                        resultadosDirectosPorActividad[act.id] = { realizada: false, nota: null, notaNum: null };
+                        resultadosDirectosPorActividad[act.id] = { realizada: false, nota: null, notaNum: null, cerradaEnMoodle: false };
                     }
                 }
 
-                // PASO 2: Leer la Tabla General de Calificaciones (Doble verificación)
+                // PASO 2: Leer la Tabla General de Calificaciones
                 let urlTablaEfectiva = urlCalificacionesConfigurada;
                 if (!urlTablaEfectiva && courseIdDetectado) {
                     urlTablaEfectiva = `https://9002.edusalta.gov.ar/grade/report/user/index.php?id=${courseIdDetectado}`;
@@ -982,7 +1043,6 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                             const materiaLimpia = extraerMateriaLimpia(textoFila);
 
                             if (semEncontrada && materiaLimpia) {
-                                // Si estamos en modo "Solo Evaluaciones", ignoramos semanas S02..S12 de la tabla
                                 if (soloEvaluaciones && !SEMANAS_EXAMENES.includes(semEncontrada)) return;
 
                                 const esExamen = SEMANAS_EXAMENES.includes(semEncontrada);
@@ -995,7 +1055,8 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                                             realizada: true,
                                             nota: evalFila.nota,
                                             notaNum: nNum,
-                                            aprobada
+                                            aprobada,
+                                            cerradaEnMoodle: false
                                         };
                                     }
                                 } else {
@@ -1019,7 +1080,7 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                     }
                 }
 
-                // PASO 3: Combinar ambas verificaciones y aplicar la regla especial para Evaluaciones y Semana 15 (Nota >= 6 Aprobado, < 6 Recuperatorio)
+                // PASO 3: Combinar ambas verificaciones diferenciando "En tiempo / Pendiente" vs "Desaprobado / Cerrada -> Recuperatorio S15"
                 for (const act of actividadesAEscanear) {
                     const sem = act.semana;
                     const mat = act.materia;
@@ -1041,7 +1102,7 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                     const dioPositivoEnTablaPorId = Boolean(infoTablaId?.realizada);
                     const dioPositivoEnTablaPorNombre = datosSemanas[sem].completas.some(m => mismaMateria(m, mat)) ||
                         Boolean(datosSemanas[sem].detalle_notas?.[mat]?.realizada);
-                    const resultadoDirecto = resultadosDirectosPorActividad[act.id] || { realizada: false, nota: null, notaNum: null };
+                    const resultadoDirecto = resultadosDirectosPorActividad[act.id] || { realizada: false, nota: null, notaNum: null, cerradaEnMoodle: false };
 
                     const estaRealizada = resultadoDirecto.realizada || dioPositivoEnTablaPorId || dioPositivoEnTablaPorNombre;
                     const notaNumFinal = resultadoDirecto.notaNum ?? infoTablaId?.notaNum ?? datosSemanas[sem].detalle_notas?.[mat]?.notaNum ?? null;
@@ -1054,7 +1115,7 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                         if (!datosSemanas[sem].detalle_notas) datosSemanas[sem].detalle_notas = {};
 
                         if (estaRealizada) {
-                            // REGLA DE EVALUACIONES: 6.00 o más = Aprobado | Menos de 6.00 = Desaprobado (Va a Recuperatorio S15)
+                            // YA LA HIZO: 6 o más = Aprobado | Menos de 6 = Desaprobado (sí va a recuperar en S15)
                             const aprobada = notaNumFinal !== null ? notaNumFinal >= 6.0 : true;
                             const estadoTexto = aprobada ? 'Aprobado' : 'Desaprobado';
                             const etiquetaEval = notaStrFinal
@@ -1065,26 +1126,30 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                                 realizada: true,
                                 nota: notaStrFinal,
                                 notaNum: notaNumFinal,
-                                aprobada
+                                aprobada,
+                                cerradaEnMoodle: false
                             };
 
                             if (aprobada) {
                                 datosSemanas[sem].completas.push(etiquetaEval);
                             } else {
-                                // Si sacó menos de 6, queda registrada su nota pero figura como pendiente de recuperar en S15
                                 datosSemanas[sem].faltan.push(etiquetaEval);
                             }
                         } else {
+                            // NO LA HIZO TODAVÍA (En Calificaciones sale "-" y en el enlace sale "Intento de cuestionario")
+                            const cerradaEfectiva = evaluacionesCerradasManual || Boolean(resultadoDirecto.cerradaEnMoodle);
                             datosSemanas[sem].detalle_notas[mat] = {
                                 realizada: false,
                                 nota: null,
                                 notaNum: null,
-                                aprobada: false
+                                aprobada: false,
+                                cerradaEnMoodle: Boolean(resultadoDirecto.cerradaEnMoodle)
                             };
-                            datosSemanas[sem].faltan.push(`${mat} (Sin rendir)`);
+                            datosSemanas[sem].faltan.push(
+                                cerradaEfectiva ? `${mat} (Sin rendir -> S15)` : `${mat} (Pendiente - En tiempo)`
+                            );
                         }
                     } else {
-                        // SEMANAS REGULARES (S02 a S12): Solo importa si está realizada o no
                         if (estaRealizada) {
                             const etiquetaConNota = notaStrFinal ? `${mat} (${notaStrFinal})` : mat;
                             datosSemanas[sem].completas.push(etiquetaConNota);
@@ -1095,7 +1160,7 @@ async function ejecutarScrapingMoodle(sede, modulo, orientacion, anio, periodo, 
                 }
 
                 // PASO 4: Construir el resumen y guardar en Neon
-                const resumenFinal = construirResumenTextoAlumno(al.nombre_completo, datosSemanas);
+                const resumenFinal = construirResumenTextoAlumno(al.nombre_completo, datosSemanas, evaluacionesCerradasManual);
 
                 await pool.query(
                     `UPDATE cursadas_modulos SET seguimiento_semanal = $1::jsonb, resumen_texto = $2, ultima_actualizacion_bot = CURRENT_TIMESTAMP WHERE id = $3`,
